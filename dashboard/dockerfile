@@ -1,0 +1,22 @@
+# Image du dashboard NIDS -- Python pur, aucune dependance materielle.
+# Ne contient PAS le detecteur (voir note dans docker-compose.yml) : le
+# dashboard LIT un journal et des metriques ecrits ailleurs, il ne capture
+# jamais de trafic lui-meme.
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app.py .
+COPY static ./static
+
+EXPOSE 5000
+
+# --host 0.0.0.0 est INDISPENSABLE ici : par defaut app.py n'ecoute que sur
+# 127.0.0.1 (localhost), ce qui serait inatteignable depuis l'exterieur du
+# conteneur meme avec le port publie -- docker-compose.yml le precise dans
+# "command", pas besoin d'y toucher ici.
+ENTRYPOINT ["python", "app.py"]

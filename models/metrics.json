@@ -1,0 +1,378 @@
+{
+  "trained_at": "2026-10-22T18:23:33.132163+00:00",
+  "dataset": {
+    "total_flows": 1119468,
+    "by_label": {
+      "benign": 7385,
+      "brute_force": 6575,
+      "slowloris": 6257,
+      "icmp_flood": 757,
+      "udp_scan": 1284,
+      "syn_flood": 422691,
+      "http_flood": 22973,
+      "port_scan": 413116,
+      "udp_flood": 238430
+    },
+    "by_family": {
+      "scan": 414400,
+      "brute_force": 6575,
+      "benign": 7385,
+      "ddos": 691108
+    }
+  },
+  "model1_binary": {
+    "report": {
+      "benign": {
+        "precision": 0.963001745200698,
+        "recall": 0.996028880866426,
+        "f1-score": 0.9792369121561668,
+        "support": 2770.0
+      },
+      "anormal": {
+        "precision": 0.9999686633791702,
+        "recall": 0.9996981106282147,
+        "f1-score": 0.9998333687009452,
+        "support": 351122.0
+      },
+      "accuracy": 0.9996693906615578,
+      "macro avg": {
+        "precision": 0.9814852042899341,
+        "recall": 0.9978634957473204,
+        "f1-score": 0.989535140428556,
+        "support": 353892.0
+      },
+      "weighted avg": {
+        "precision": 0.9996793141897158,
+        "recall": 0.9996693906615578,
+        "f1-score": 0.9996721551537924,
+        "support": 353892.0
+      }
+    }
+  },
+  "model2": {
+    "fine": {
+      "classes": [
+        "brute_force",
+        "http_flood",
+        "icmp_flood",
+        "port_scan",
+        "slowloris",
+        "syn_flood",
+        "udp_flood",
+        "udp_scan"
+      ],
+      "report": {
+        "brute_force": {
+          "precision": 0.9997535124476213,
+          "recall": 1.0,
+          "f1-score": 0.9998767410329101,
+          "support": 4056.0
+        },
+        "http_flood": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1-score": 1.0,
+          "support": 13230.0
+        },
+        "icmp_flood": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1-score": 1.0,
+          "support": 530.0
+        },
+        "port_scan": {
+          "precision": 1.0,
+          "recall": 0.9999887823209378,
+          "f1-score": 0.9999943911290097,
+          "support": 89145.0
+        },
+        "slowloris": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1-score": 1.0,
+          "support": 1935.0
+        },
+        "syn_flood": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1-score": 1.0,
+          "support": 167602.0
+        },
+        "udp_flood": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1-score": 1.0,
+          "support": 74384.0
+        },
+        "udp_scan": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1-score": 1.0,
+          "support": 240.0
+        },
+        "accuracy": 0.9999971519870586,
+        "macro avg": {
+          "precision": 0.9999691890559527,
+          "recall": 0.9999985977901172,
+          "f1-score": 0.9999838915202399,
+          "support": 351122.0
+        },
+        "weighted avg": {
+          "precision": 0.9999971526890584,
+          "recall": 0.9999971519870586,
+          "f1-score": 0.9999971521545932,
+          "support": 351122.0
+        }
+      },
+      "confusion_matrix": [
+        [
+          4056,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          13230,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          530,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0,
+          89144,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          1935,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          167602,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          74384,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          240
+        ]
+      ]
+    },
+    "family": {
+      "classes": [
+        "brute_force",
+        "ddos",
+        "scan"
+      ],
+      "report": {
+        "brute_force": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1-score": 1.0,
+          "support": 4056.0
+        },
+        "ddos": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1-score": 1.0,
+          "support": 257681.0
+        },
+        "scan": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1-score": 1.0,
+          "support": 89385.0
+        },
+        "accuracy": 1.0,
+        "macro avg": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1-score": 1.0,
+          "support": 351122.0
+        },
+        "weighted avg": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1-score": 1.0,
+          "support": 351122.0
+        }
+      },
+      "confusion_matrix": [
+        [
+          4056,
+          0,
+          0
+        ],
+        [
+          0,
+          257681,
+          0
+        ],
+        [
+          0,
+          0,
+          89385
+        ]
+      ]
+    }
+  },
+  "full_chain": {
+    "fine": {
+      "benign": {
+        "precision": 0.963001745200698,
+        "recall": 0.996028880866426,
+        "f1-score": 0.9792369121561668,
+        "support": 2770.0
+      },
+      "brute_force": {
+        "precision": 1.0,
+        "recall": 0.9916173570019724,
+        "f1-score": 0.9957910373854915,
+        "support": 4056.0
+      },
+      "http_flood": {
+        "precision": 1.0,
+        "recall": 0.9999244142101285,
+        "f1-score": 0.9999622056767073,
+        "support": 13230.0
+      },
+      "icmp_flood": {
+        "precision": 1.0,
+        "recall": 0.909433962264151,
+        "f1-score": 0.9525691699604744,
+        "support": 530.0
+      },
+      "port_scan": {
+        "precision": 0.9999775628800287,
+        "recall": 0.9998990408884402,
+        "f1-score": 0.9999383003427136,
+        "support": 89145.0
+      },
+      "slowloris": {
+        "precision": 1.0,
+        "recall": 0.9984496124031008,
+        "f1-score": 0.9992242048099301,
+        "support": 1935.0
+      },
+      "syn_flood": {
+        "precision": 1.0,
+        "recall": 0.9999880669681745,
+        "f1-score": 0.9999940334484878,
+        "support": 167602.0
+      },
+      "udp_flood": {
+        "precision": 1.0,
+        "recall": 0.9999731124973112,
+        "f1-score": 0.9999865560679188,
+        "support": 74384.0
+      },
+      "udp_scan": {
+        "precision": 0.9628099173553719,
+        "recall": 0.9708333333333333,
+        "f1-score": 0.966804979253112,
+        "support": 240.0
+      },
+      "accuracy": 0.9996693906615578,
+      "macro avg": {
+        "precision": 0.9917543583817887,
+        "recall": 0.9851275311592266,
+        "f1-score": 0.9881674887890003,
+        "support": 353892.0
+      },
+      "weighted avg": {
+        "precision": 0.9996795323356034,
+        "recall": 0.9996693906615578,
+        "f1-score": 0.9996688484946218,
+        "support": 353892.0
+      }
+    },
+    "family": {
+      "benign": {
+        "precision": 0.963001745200698,
+        "recall": 0.996028880866426,
+        "f1-score": 0.9792369121561668,
+        "support": 2770.0
+      },
+      "brute_force": {
+        "precision": 1.0,
+        "recall": 0.9916173570019724,
+        "f1-score": 0.9957910373854915,
+        "support": 4056.0
+      },
+      "ddos": {
+        "precision": 1.0,
+        "recall": 0.9997826770309025,
+        "f1-score": 0.9998913267068499,
+        "support": 257681.0
+      },
+      "scan": {
+        "precision": 0.9998769299619602,
+        "recall": 0.9998209990490574,
+        "f1-score": 0.9998489637233239,
+        "support": 89385.0
+      },
+      "accuracy": 0.9996693906615578,
+      "macro avg": {
+        "precision": 0.9907196687906645,
+        "recall": 0.9968124784870896,
+        "f1-score": 0.9936920599929581,
+        "support": 353892.0
+      },
+      "weighted avg": {
+        "precision": 0.9996793208630196,
+        "recall": 0.9996693906615578,
+        "f1-score": 0.9996719656671109,
+        "support": 353892.0
+      }
+    }
+  }
+}

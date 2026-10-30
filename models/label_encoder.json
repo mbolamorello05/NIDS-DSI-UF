@@ -1,0 +1,8 @@
+{
+  "brute_force": 0,
+  "icmp_flood": 1,
+  "port_scan": 2,
+  "syn_flood": 3,
+  "udp_flood": 4,
+  "udp_scan": 5
+}

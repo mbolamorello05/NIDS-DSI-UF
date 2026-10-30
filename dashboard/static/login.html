@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="fr" data-theme="business">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NIDS -- Connexion</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>%F0%9F%9B%A1%EF%B8%8F</text></svg>" />
+  <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.10/dist/full.min.css" rel="stylesheet" type="text/css" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+</head>
+<body class="min-h-screen flex items-center justify-center bg-base-200">
+  <form id="login-form" class="card w-96 bg-base-100 shadow-xl animate-[fadeIn_.4s_ease]">
+    <div class="card-body">
+      <div class="flex flex-col items-center gap-1 mb-2">
+        <i data-lucide="shield" class="w-10 h-10 text-primary"></i>
+        <h1 class="card-title">NIDS Dashboard</h1>
+        <p class="text-sm text-base-content/60">Connexion administrateur</p>
+      </div>
+
+      <label class="form-control w-full">
+        <div class="label"><span class="label-text">Utilisateur</span></div>
+        <input type="text" name="username" required autofocus autocomplete="username"
+               class="input input-bordered w-full" />
+      </label>
+
+      <label class="form-control w-full">
+        <div class="label"><span class="label-text">Mot de passe</span></div>
+        <input type="password" name="password" required autocomplete="current-password"
+               class="input input-bordered w-full" />
+      </label>
+
+      <div id="login-error" class="text-error text-sm text-center min-h-[1.25rem] mt-1"></div>
+
+      <button type="submit" class="btn btn-primary w-full mt-2">Se connecter</button>
+    </div>
+  </form>
+
+  <script>
+    lucide.createIcons();
+    document.getElementById("login-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const form = new FormData(e.target);
+      const errorEl = document.getElementById("login-error");
+      errorEl.textContent = "";
+      try {
+        const res = await fetch("/login", { method: "POST", body: form });
+        const data = await res.json();
+        if (data.ok) window.location.href = "/";
+        else errorEl.textContent = data.error || "Échec de connexion";
+      } catch (err) {
+        errorEl.textContent = "Impossible de contacter le serveur";
+      }
+    });
+  </script>
+</body>
+</html>

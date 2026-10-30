@@ -1,0 +1,9 @@
+{
+  "granularity": "family",
+  "target_column": "LABEL_FAMILY",
+  "classes": {
+    "brute_force": 0,
+    "ddos": 1,
+    "scan": 2
+  }
+}

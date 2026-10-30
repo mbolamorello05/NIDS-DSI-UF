@@ -1,0 +1,29 @@
+# Image du pipeline de preparation du dataset et d'entrainement.
+# A LA DIFFERENCE du detecteur, rien ici ne touche au reseau ou a une
+# carte NIC -- uniquement du traitement de fichiers .parquet deja
+# captures. Entierement portable, meme logique partout.
+#
+# A placer a la racine de nids_dataset_v2, a cote de clean_dataset.py,
+# build_features.py et train_models.py.
+#
+# CONSTRUCTION
+#   docker build -f Dockerfile.pipeline -t nids-pipeline .
+#
+# UTILISATION (depuis PowerShell, a la racine du projet)
+#   docker run --rm -v ${PWD}:/data nids-pipeline clean_dataset.py `
+#       --input-dir /data/raw_all --output-dir /data/clean
+#   docker run --rm -v ${PWD}:/data nids-pipeline build_features.py `
+#       --input /data/clean/dataset_clean.parquet --output /data/features/dataset_features.parquet
+#   docker run --rm -v ${PWD}:/data nids-pipeline train_models.py `
+#       --input /data/features/dataset_features.parquet --output-dir /data/models
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements-pipeline.txt .
+RUN pip install --no-cache-dir -r requirements-pipeline.txt
+
+COPY clean_dataset.py build_features.py train_models.py ./
+
+ENTRYPOINT ["python"]

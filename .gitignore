@@ -1,0 +1,15 @@
+# secrets
+.env
+
+# donnees d'execution et d'entrainement (non versionnees)
+detections_v6.jsonl
+*.jsonl
+config/
+raw_all/
+features/
+clean/
+
+# python
+venv/
+__pycache__/
+*.pyc

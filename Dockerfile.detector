@@ -1,0 +1,17 @@
+# Detecteur NIDS temps reel -- a lancer avec network_mode: host + NET_RAW
+# (voir docker-compose.yml). Linux uniquement.
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc libpcap-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+# xgboost = meme version qu'a l'entrainement (requirements-pipeline.txt)
+RUN pip install --no-cache-dir nfstream xgboost==2.1.1 numpy psutil scapy
+
+COPY realtime_detector_v6.py detector-entrypoint.sh ./
+# tolere un fichier edite sous Windows (fins de ligne CRLF)
+RUN sed -i 's/\r$//' detector-entrypoint.sh && chmod +x detector-entrypoint.sh
+
+ENTRYPOINT ["/app/detector-entrypoint.sh"]

@@ -1,0 +1,4 @@
+# Evite les fins de ligne Windows (CRLF) qui cassent les scripts sous Linux
+*.sh text eol=lf
+Dockerfile* text eol=lf
+*.yml text eol=lf

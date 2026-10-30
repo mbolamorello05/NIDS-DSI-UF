@@ -1,0 +1,41 @@
+# A la racine du projet.   Lancement :  docker compose up -d --build
+# Prerequis : un fichier .env contenant ADMIN_PASSWORD (voir .env.example).
+services:
+  # Voit les VRAIES interfaces de la machine (network_mode: host), les publie
+  # dans /data/config/interfaces.json, et capture sur celle choisie par l'admin.
+  detector:
+    build:
+      context: .
+      dockerfile: Dockerfile.detector
+    network_mode: host
+    cap_drop: [ALL]
+    cap_add: [NET_RAW, NET_ADMIN]      # strict necessaire pour la capture
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ./models:/app/models:ro
+      - nids-data:/data
+    restart: unless-stopped
+
+  # Lit le journal, affiche les interfaces, ecrit le choix de l'admin.
+  dashboard:
+    build: ./dashboard
+    ports:
+      - "5000:5000"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ./models:/data/models:ro
+      - nids-data:/data
+    command: [
+      "--log", "/data/detections_v6.jsonl",
+      "--models-dir", "/data/models",
+      "--config-dir", "/data/config",
+      "--admin-password", "${ADMIN_PASSWORD:?ADMIN_PASSWORD manquant : copie .env.example vers .env}",
+      "--host", "0.0.0.0",
+      "--port", "5000"
+    ]
+    restart: unless-stopped
+
+# Journal des detections + choix d'interface : persistants, hors du depot Git.
+volumes:
+  nids-data:

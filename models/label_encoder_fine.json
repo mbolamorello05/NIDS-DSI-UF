@@ -1,0 +1,14 @@
+{
+  "granularity": "fine",
+  "target_column": "LABEL",
+  "classes": {
+    "brute_force": 0,
+    "http_flood": 1,
+    "icmp_flood": 2,
+    "port_scan": 3,
+    "slowloris": 4,
+    "syn_flood": 5,
+    "udp_flood": 6,
+    "udp_scan": 7
+  }
+}
