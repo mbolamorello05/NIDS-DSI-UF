@@ -36,6 +36,22 @@ services:
     ]
     restart: unless-stopped
 
+  # Reponse aux detections (blocage temporaire via nftables). Demarre en
+  # "dry-run" : il journalise ce qu'il BLOQUERAIT sans rien toucher.
+  # Passage en blocage reel :
+  #   docker compose exec responder python /app/responder.py --set-mode enforce
+  responder:
+    build:
+      context: .
+      dockerfile: Dockerfile.responder
+    network_mode: host
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]               # seul service autorise a modifier le pare-feu
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - nids-data:/data
+    restart: unless-stopped
+
 # Journal des detections + choix d'interface : persistants, hors du depot Git.
 volumes:
   nids-data:

@@ -1,0 +1,11 @@
+# Responder NIDS : applique la politique de reponse via nftables (Linux, host network).
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends nftables \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir psutil
+
+WORKDIR /app
+COPY responder.py .
+
+ENTRYPOINT ["python", "-u", "/app/responder.py"]
