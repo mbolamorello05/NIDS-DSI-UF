@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 # xgboost = meme version qu'a l'entrainement (requirements-pipeline.txt)
-RUN pip install --no-cache-dir nfstream xgboost==2.1.1 numpy psutil scapy
+RUN pip install --no-cache-dir nfstream xgboost==2.1.1 numpy psutil scapy scikit-learn==1.4.2
 
 COPY realtime_detector_v6.py detector-entrypoint.sh ./
 # tolere un fichier edite sous Windows (fins de ligne CRLF)
