@@ -2,3 +2,5 @@
 *.sh text eol=lf
 Dockerfile* text eol=lf
 *.yml text eol=lf
+# Bibliotheques minifiees : ne jamais les modifier (conversion de fins de ligne comprise)
+dashboard/static/vendor/** -text

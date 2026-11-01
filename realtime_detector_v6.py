@@ -33,6 +33,8 @@ import argparse
 import json
 import os
 import sys
+import queue
+import threading
 import time
 from collections import Counter, deque
 from datetime import datetime, timezone
@@ -49,7 +51,10 @@ ACTIVE_TIMEOUT = 60
 WINDOW_MS = 10_000          # doit rester egal a la fenetre de build_features.py
 SOURCE_IDLE_CLEANUP_S = 60  # purge les buffers de sources inactives depuis ce temps
 CLEANUP_EVERY_S = 30        # frequence du balayage de nettoyage
-HEARTBEAT_EVERY = 200        # affiche un point d'etat tous les N flux
+HEARTBEAT_S = 10            # point d'etat toutes les N secondes (et non plus tous les N flux)
+BATCH_MAX = 512             # nb max de flux classes d'un seul appel au modele
+QUEUE_MAX = 100_000         # file d'attente entre la capture et la classification
+ALERT_PRINT_S = 1.0         # les alertes sont resumees dans la console 1 fois par seconde
 
 # Doit rester identique a FAMILY dans build_features.py. Sert ici a
 # VERIFIER la coherence entre les deux modeles 2, qui sont entraines
@@ -237,6 +242,121 @@ def load_models(models_dir: str):
 
 
 # ============================================================
+# CLASSIFICATION PAR LOTS
+# ============================================================
+# Pourquoi : appeler predict_proba() sur UN flux a la fois (jusqu'a 3 appels
+# par flux anormal) coute ~1 ms d'overhead chacun. Pendant un flood, des
+# dizaines de milliers de flux arrivent : le detecteur prenait du retard et
+# continuait d'ecrire des alertes bien apres la fin de l'attaque. Ici on
+# classe tout ce qui est disponible d'un coup, en un seul appel vectorise.
+def classify_batch(items, windows, feature_columns, model1, model2s, threshold):
+    """items : liste de (flow, timestamp_iso) dans l'ordre d'arrivee.
+    Renvoie la liste des enregistrements (meme format qu'avant, meme ordre)."""
+    rows = []
+    for flow, _ts in items:
+        # La fenetre par source est a etat : on la met a jour flux par flux,
+        # dans l'ordre, exactement comme avant.
+        win_vals = windows.push(
+            flow.src_ip, flow.bidirectional_first_seen_ms, flow.dst_port,
+            flow.dst_ip, flow.protocol, flow.bidirectional_packets,
+            flow.bidirectional_bytes,
+        )
+        flow_vals = {
+            "SRC_PORT": flow.src_port,
+            "DST_PORT": flow.dst_port,
+            "PROTOCOL": flow.protocol,
+            "BIDIRECTIONAL_PACKETS": flow.bidirectional_packets,
+            "BIDIRECTIONAL_BYTES": flow.bidirectional_bytes,
+            "BIDIRECTIONAL_DURATION_MS": flow.bidirectional_duration_ms,
+            "SRC2DST_PACKETS": flow.src2dst_packets,
+            "SRC2DST_BYTES": flow.src2dst_bytes,
+            "DST2SRC_PACKETS": flow.dst2src_packets,
+            "DST2SRC_BYTES": flow.dst2src_bytes,
+        }
+        flow_vals.update(win_vals)
+        rows.append([flow_vals[c] for c in feature_columns])
+
+    X = np.array(rows, dtype=np.float32)
+    p_anomal = model1.predict_proba(X)[:, 1]
+    is_anomal = p_anomal >= threshold
+    anomal_idx = np.flatnonzero(is_anomal)
+
+    records = []
+    for (flow, ts), p, anomal in zip(items, p_anomal, is_anomal):
+        records.append({
+            "timestamp": ts,
+            "src_ip": flow.src_ip, "src_port": flow.src_port,
+            "dst_ip": flow.dst_ip, "dst_port": flow.dst_port,
+            "protocol": flow.protocol,
+            "model1_proba_anomal": round(float(p), 4),
+            "verdict": "anomal" if anomal else "benign",
+        })
+
+    if len(anomal_idx):
+        Xa = X[anomal_idx]
+        for granularity, (model2, id_to_label) in model2s.items():
+            proba = model2.predict_proba(Xa)
+            best = np.argmax(proba, axis=1)
+            for k, i in enumerate(anomal_idx):
+                records[i][f"{granularity}_label"] = id_to_label[int(best[k])]
+                records[i][f"{granularity}_confidence"] = round(float(proba[k, best[k]]), 4)
+        for i in anomal_idx:
+            rec = records[i]
+            expected_fam = FAMILY.get(rec.get("fine_label"))
+            rec["family_fine_conflict"] = (bool(expected_fam) and "family_label" in rec
+                                           and expected_fam != rec["family_label"])
+    return records
+
+
+class AlertPrinter:
+    """Console : un resume par seconde et par groupe (source -> cible, type),
+    au lieu d'une ligne par flux. Evite de noyer les logs Docker pendant un
+    flood (des dizaines de milliers d'ecritures = ralentissement du detecteur)."""
+
+    def __init__(self) -> None:
+        self.groups: dict = {}
+        self.conflicts = 0
+        self.last = time.time()
+
+    def add(self, rec: dict) -> None:
+        key = (rec["src_ip"], rec["dst_ip"], rec["dst_port"],
+               rec.get("family_label", "?"), rec.get("fine_label", "?"))
+        n, conf = self.groups.get(key, (0, 0.0))
+        self.groups[key] = (n + 1, conf + rec.get("family_confidence", 0))
+        self.conflicts += bool(rec.get("family_fine_conflict"))
+
+    def maybe_flush(self, force: bool = False) -> None:
+        now = time.time()
+        if not self.groups or (not force and now - self.last < ALERT_PRINT_S):
+            return
+        self.last = now
+        top = sorted(self.groups.items(), key=lambda kv: -kv[1][0])
+        for (src, dst, port, fam, fine), (n, conf) in top[:5]:
+            print(f"[ALERTE] {src} -> {dst}:{port} | {fam}/{fine} x{n} "
+                  f"(conf. moy. {conf / n:.1%})", flush=True)
+        if len(top) > 5:
+            print(f"[ALERTE] ... et {len(top) - 5} autre(s) groupe(s)", flush=True)
+        if self.conflicts:
+            print(f"[ALERTE] {self.conflicts} desaccord(s) entre modeles", flush=True)
+        self.groups, self.conflicts = {}, 0
+
+
+_END = object()   # marqueur : la capture s'est terminee
+
+
+def _reader(streamer, q: "queue.Queue") -> None:
+    """Thread de lecture : sort les flux de NFStream et les range dans la file
+    des qu'ils sont disponibles, pour que la capture ne soit jamais freinee
+    par la classification."""
+    try:
+        for flow in streamer:
+            q.put((flow, datetime.now(timezone.utc).isoformat()))
+        q.put(_END)
+    except BaseException as exc:          # ex. interface invalide -> remonte au thread principal
+        q.put(exc)
+
+
+# ============================================================
 # BOUCLE PRINCIPALE
 # ============================================================
 def main() -> int:
@@ -305,88 +425,71 @@ def main() -> int:
 
     stats = Counter()
     n_flows = 0
+    printer = AlertPrinter()
     # buffering=1 => ligne par ligne : chaque detection est ecrite sur le
     # disque des le \n, sans attendre que le tampon se remplisse. Essentiel
     # pour que le dashboard (autre processus) voie les nouvelles lignes
     # rapidement au lieu de les recevoir par rafales.
     log_f = open(args.log, "a", encoding="utf-8", buffering=1)
 
+    q: "queue.Queue" = queue.Queue(maxsize=QUEUE_MAX)
+    threading.Thread(target=_reader, args=(streamer, q), daemon=True).start()
+    last_beat, beat_flows = time.time(), 0
+
     try:
-        for flow in streamer:
-            n_flows += 1
+        while True:
+            try:
+                first = q.get(timeout=0.5)
+            except queue.Empty:
+                printer.maybe_flush()
+                continue
+            items = [first]
+            while len(items) < BATCH_MAX:
+                try:
+                    items.append(q.get_nowait())
+                except queue.Empty:
+                    break
+            finished = False
+            flows = []
+            for it in items:
+                if isinstance(it, BaseException):
+                    raise it
+                if it is _END:
+                    finished = True
+                else:
+                    flows.append(it)
+            if not flows:
+                break
+            records = classify_batch(flows, windows, feature_columns, model1,
+                                     model2s, args.threshold)
 
-            flow_vals = {
-                "SRC_PORT": flow.src_port,
-                "DST_PORT": flow.dst_port,
-                "PROTOCOL": flow.protocol,
-                "BIDIRECTIONAL_PACKETS": flow.bidirectional_packets,
-                "BIDIRECTIONAL_BYTES": flow.bidirectional_bytes,
-                "BIDIRECTIONAL_DURATION_MS": flow.bidirectional_duration_ms,
-                "SRC2DST_PACKETS": flow.src2dst_packets,
-                "SRC2DST_BYTES": flow.src2dst_bytes,
-                "DST2SRC_PACKETS": flow.dst2src_packets,
-                "DST2SRC_BYTES": flow.dst2src_bytes,
-            }
-            win_vals = windows.push(
-                flow.src_ip, flow.bidirectional_first_seen_ms, flow.dst_port,
-                flow.dst_ip, flow.protocol, flow.bidirectional_packets,
-                flow.bidirectional_bytes,
-            )
-            flow_vals.update(win_vals)
+            # une seule ecriture pour tout le lot
+            log_f.write("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records))
+            n_flows += len(records)
+            beat_flows += len(records)
+            for r in records:
+                if r["verdict"] == "anomal":
+                    stats[r.get("family_label", "?")] += 1
+                    printer.add(r)
+                else:
+                    stats["benign"] += 1
+                    if args.verbose:
+                        print(f"[benign] {r['src_ip']}:{r['src_port']} -> "
+                              f"{r['dst_ip']}:{r['dst_port']}")
+            printer.maybe_flush()
+            if finished:
+                break
 
-            X = np.array([[flow_vals[c] for c in feature_columns]], dtype=np.float32)
-            p_anomal = float(model1.predict_proba(X)[0, 1])
-            is_anomal = p_anomal >= args.threshold
-
-            record = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "src_ip": flow.src_ip, "src_port": flow.src_port,
-                "dst_ip": flow.dst_ip, "dst_port": flow.dst_port,
-                "protocol": flow.protocol,
-                "model1_proba_anomal": round(p_anomal, 4),
-                "verdict": "anomal" if is_anomal else "benign",
-            }
-
-            if is_anomal:
-                for granularity, (model2, id_to_label) in model2s.items():
-                    proba = model2.predict_proba(X)[0]
-                    idx = int(np.argmax(proba))
-                    record[f"{granularity}_label"] = id_to_label[idx]
-                    record[f"{granularity}_confidence"] = round(float(proba[idx]), 4)
-
-                fam = record.get("family_label", "?")
-                fam_c = record.get("family_confidence", 0)
-                fine = record.get("fine_label", "?")
-                fine_c = record.get("fine_confidence", 0)
-
-                # Les deux modeles 2 sont entraines independamment : rien ne
-                # garantit qu'ils s'accordent. Si la famille deduite du type
-                # fin ne correspond pas a la famille predite directement,
-                # c'est un desaccord entre modeles -- a signaler plutot qu'a
-                # laisser passer silencieusement comme si tout concordait.
-                expected_fam = FAMILY.get(fine)
-                conflict = bool(expected_fam) and "family_label" in record and expected_fam != fam
-                record["family_fine_conflict"] = conflict
-
-                marker = " ⚠ DESACCORD MODELES" if conflict else ""
-                print(f"[ALERTE]{marker} {flow.src_ip}:{flow.src_port} -> "
-                      f"{flow.dst_ip}:{flow.dst_port} | "
-                      f"Famille: {fam} ({fam_c:.1%}) | Type: {fine} ({fine_c:.1%})")
-                stats[fam] += 1
-            else:
-                stats["benign"] += 1
-                if args.verbose:
-                    print(f"[benign] {flow.src_ip}:{flow.src_port} -> "
-                          f"{flow.dst_ip}:{flow.dst_port}")
-
-            log_f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            if n_flows % HEARTBEAT_EVERY == 0:
-                log_f.flush()
-                print(f"  ... {n_flows} flux traites | {dict(stats)}")
+            now = time.time()
+            if now - last_beat >= HEARTBEAT_S:
+                print(f"  ... {n_flows} flux traites | {beat_flows / (now - last_beat):.0f} flux/s | "
+                      f"file d'attente : {q.qsize()} | {dict(stats)}", flush=True)
+                last_beat, beat_flows = now, 0
 
     except KeyboardInterrupt:
         print("\n[ARRET] demande par l'utilisateur.")
     finally:
+        printer.maybe_flush(force=True)
         log_f.close()
 
     print("-" * 70)
