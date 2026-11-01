@@ -56,11 +56,6 @@ function applyRecord(record) {
 
   counters.total += 1;
   counters[fam] = (counters[fam] || 0) + 1;
-  ["total", "benign", "scan", "ddos", "brute"].forEach((k, i) => {
-    const val = i === 0 ? counters.total : counters[["", "benign", "scan", "ddos", "brute_force"][i]] || 0;
-    document.getElementById(`kpi-${k}`).textContent = val.toLocaleString("fr-FR");
-  });
-
   const s = sources.get(record.src_ip) || { total: 0, anomal: 0 };
   s.total += 1;
   if (record.verdict === "anomal") s.anomal += 1;
@@ -72,11 +67,37 @@ function applyRecord(record) {
   timeline.set(key, bucket);
   while (timeline.size > TIMELINE_MINUTES) timeline.delete(timeline.keys().next().value);
 
-  renderTimelineChart();
-  renderDonut();
-  renderSparklines();
-  renderFeedRow(record, fam);
+  // Perf : on ne touche PAS au DOM ici. Pendant une attaque, des milliers
+  // d'enregistrements arrivent par seconde ; redessiner 7 graphiques pour
+  // chacun gelait l'onglet. Les donnees sont mises a jour ici, l'affichage
+  // est regroupe dans scheduleRender() (au plus 2 fois par seconde).
+  liveRecords.unshift(record);
+  if (liveRecords.length > 2000) liveRecords.length = 2000;
   if (record.verdict === "anomal") pushBell(record, fam);
+  scheduleRender();
+}
+
+function renderKpis() {
+  ["total", "benign", "scan", "ddos", "brute"].forEach((k, i) => {
+    const val = i === 0 ? counters.total : counters[["", "benign", "scan", "ddos", "brute_force"][i]] || 0;
+    document.getElementById(`kpi-${k}`).textContent = val.toLocaleString("fr-FR");
+  });
+}
+
+let renderTimer = null;
+function scheduleRender() {
+  if (renderTimer) return;
+  renderTimer = setTimeout(() => {
+    renderTimer = null;
+    renderKpis();
+    renderTimelineChart();
+    renderDonut();
+    renderSparklines();
+    renderRecentAlerts();
+    renderBell();
+    const pa = document.getElementById("page-alerts");
+    if (pa && !pa.classList.contains("hidden")) renderHistoryTable();
+  }, 500);
 }
 
 // ============================================================
@@ -86,9 +107,15 @@ function pushBell(record, fam) {
   bellItems.unshift({ record, fam });
   if (bellItems.length > 8) bellItems.pop();
   bellUnread += 1;
-  const badge = document.getElementById("bell-badge");
-  badge.textContent = bellUnread > 9 ? "9+" : bellUnread;
-  badge.classList.remove("hidden");
+}
+
+function renderBell() {
+  if (!bellItems.length) return;
+  if (bellUnread > 0) {
+    const badge = document.getElementById("bell-badge");
+    badge.textContent = bellUnread > 9 ? "9+" : bellUnread;
+    badge.classList.remove("hidden");
+  }
   document.getElementById("bell-list").innerHTML = bellItems.map(({ record: r, fam: f }) => `
     <li class="py-1.5 border-b border-base-200 last:border-0">
       <div class="flex items-center justify-between">
