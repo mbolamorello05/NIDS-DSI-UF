@@ -18,18 +18,30 @@ UNBLOCK_PATH = f"{DATA}/config/unblock_requests.json"
 STATE_PATH = f"{DATA}/blocks.json"
 EVENTS_PATH = f"{DATA}/response_events.jsonl"
 
+# Deux profils de duree de blocage :
+#   demo   (defaut) : blocage de 60 s, sans escalade -> permet de rejouer des
+#                     attaques depuis la meme machine sans l'exclure durablement.
+#   strict          : 10 / 15 min, doublees a chaque recidive, plafond 24 h
+#                     (exclusion plus severe, adaptee a un usage en production).
+PROFILES = {
+    "demo":   {"max_ttl_s": 60,    "ttl_s": {"ddos": 60,  "brute_force": 60}},
+    "strict": {"max_ttl_s": 86400, "ttl_s": {"ddos": 600, "brute_force": 900}},
+}
+
 DEFAULT_POLICY = {
     "mode": "dry-run",
     "allowlist": [],              # IP/CIDR jamais bloquees (scanners du SOC, poste admin...)
     "max_active_blocks": 50,      # disjoncteur : au-dela, plus aucun blocage automatique
-    "max_ttl_s": 86400,
+    "max_ttl_s": PROFILES["demo"]["max_ttl_s"],   # plafond de la duree (escalade comprise)
     "rules": {
         # Un scan peut etre legitime (SOC, audit) : on alerte, on ne bloque pas.
         "scan": {"action": "alert_only"},
         "brute_force": {"action": "block", "min_confidence": 0.95, "min_proba": 0.9,
-                        "min_events": 5, "window_s": 60, "ttl_s": 900, "protocols": [6]},
+                        "min_events": 5, "window_s": 60,
+                        "ttl_s": PROFILES["demo"]["ttl_s"]["brute_force"], "protocols": [6]},
         "ddos": {"action": "block", "min_confidence": 0.97, "min_proba": 0.9,
-                 "min_events": 20, "window_s": 30, "ttl_s": 600, "protocols": [6]},
+                 "min_events": 20, "window_s": 30,
+                 "ttl_s": PROFILES["demo"]["ttl_s"]["ddos"], "protocols": [6]},
     },
 }
 
@@ -361,10 +373,17 @@ def replay(path):
 
 
 # ------------------------------------------------------------------ commandes d'administration
+def describe_ttl(pol):
+    parts = [f"{f} {r['ttl_s']}s" for f, r in pol["rules"].items() if r.get("action") == "block"]
+    return ", ".join(parts) + f" (plafond {pol['max_ttl_s']}s)"
+
+
 def main():
     ap = argparse.ArgumentParser(description="Responder NIDS")
     ap.add_argument("--status", action="store_true", help="mode + blocages actifs")
     ap.add_argument("--set-mode", choices=["off", "dry-run", "enforce"])
+    ap.add_argument("--set-profile", choices=sorted(PROFILES),
+                    help="duree des blocages : demo (60 s, sans escalade) ou strict (10-15 min, escalade jusqu'a 24 h)")
     ap.add_argument("--unblock", metavar="IP")
     ap.add_argument("--replay", metavar="FICHIER.jsonl",
                     help="rejoue un journal en dry-run pour regler les seuils")
@@ -376,12 +395,22 @@ def main():
         p["mode"] = a.set_mode
         write_json(POLICY_PATH, p)
         return print(f"mode -> {a.set_mode} (pris en compte sous ~2 s)")
+    if a.set_profile:
+        prof = PROFILES[a.set_profile]
+        p = read_json(POLICY_PATH, copy.deepcopy(DEFAULT_POLICY))
+        p["max_ttl_s"] = prof["max_ttl_s"]
+        for fam, ttl in prof["ttl_s"].items():
+            p.setdefault("rules", {}).setdefault(fam, copy.deepcopy(DEFAULT_POLICY["rules"][fam]))["ttl_s"] = ttl
+        write_json(POLICY_PATH, p)
+        return print(f"profil -> {a.set_profile} : {describe_ttl(p)} (pris en compte sous ~2 s)")
     if a.unblock:
         reqs = read_json(UNBLOCK_PATH, [])
         write_json(UNBLOCK_PATH, reqs + [a.unblock])
         return print(f"demande de deblocage envoyee pour {a.unblock}")
     if a.status:
-        print("mode :", load_policy()["mode"])
+        pol = load_policy()
+        print("mode :", pol["mode"])
+        print("durees :", describe_ttl(pol))
         blocks = read_json(STATE_PATH, {}).get("blocks", {})
         if not blocks:
             return print("aucun blocage actif")
