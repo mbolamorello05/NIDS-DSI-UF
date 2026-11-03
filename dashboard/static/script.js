@@ -1,10 +1,13 @@
 // Dashboard NIDS (Tailwind + daisyUI) -- routage de pages sans rechargement,
 // flux SSE en direct, et chargement a la demande pour Performance/Parametres.
 
-const MAX_FEED_ROWS = 300;
 const TIMELINE_MINUTES = 30;
+<<<<<<< HEAD
 const GROUP_WINDOW_MS = 3000;
 const PAGE_TITLES = { dashboard: "Tableau de bord", alerts: "Alertes", performance: "Performance du modèle", prevention: "Prévention", settings: "Paramètres" };
+=======
+const PAGE_TITLES = { dashboard: "Tableau de bord", alerts: "Alertes", performance: "Performance du modèle", settings: "Paramètres" };
+>>>>>>> d7a75a312beb9b3f76bcc4776b690a2dd993b3c0
 const FAMILY_COLOR = { benign: "#16a34a", scan: "#f59e0b", ddos: "#ef4444", brute_force: "#a855f7" };
 
 // ============================================================
@@ -45,37 +48,73 @@ document.querySelectorAll("[data-page]").forEach(btn => btn.addEventListener("cl
 const counters = { total: 0, benign: 0, scan: 0, ddos: 0, brute_force: 0 };
 const sources = new Map();
 const timeline = new Map();   // "HH:MM" -> {benign,scan,ddos,brute_force}
-const feedGroups = new Map();
 const bellItems = [];
 let bellUnread = 0;
 
 function familyOf(r) { return r.verdict === "benign" ? "benign" : (r.family_label || "ddos"); }
 function minuteKey(ts) { return ts.slice(11, 16); }
 
-function applyRecord(record) {
-  const fam = familyOf(record);
+// ------------------------------------------------------------
+// Le serveur n'envoie plus chaque flux : il envoie des GROUPES
+// ({source, cible, famille, type, nombre de flux, premier/dernier instant}),
+// un message toutes les 0,5 s. Les compteurs restent exacts (somme des
+// "count"), mais le navigateur traite quelques lignes au lieu de milliers.
+// ------------------------------------------------------------
+const INCIDENT_MERGE_MS = 10000;   // meme groupe revu dans les 10 s = meme incident
+const MAX_LIVE_INCIDENTS = 300;
+const liveIncidents = [];          // le plus recent d'abord
+function incidentKey(g) { return `${g.src_ip}|${g.dst_ip}|${g.family}|${g.fine_label}`; }
 
-  counters.total += 1;
-  counters[fam] = (counters[fam] || 0) + 1;
-  const s = sources.get(record.src_ip) || { total: 0, anomal: 0 };
-  s.total += 1;
-  if (record.verdict === "anomal") s.anomal += 1;
-  sources.set(record.src_ip, s);
+function destLabel(g, live) {
+  if (g.family === "benign") return "--";
+  const host = g.dst_ip || "plusieurs cibles";
+  if (g.n_ports <= 1) return g.ports.length ? `${host}:${g.ports[0]}` : host;
+  if (g.n_ports <= g.ports.length) return `${host}:${g.ports.join(",")}`;
+  return live ? `${host} (plusieurs ports)` : `${host} (${g.n_ports.toLocaleString("fr-FR")} ports)`;
+}
 
-  const key = minuteKey(record.timestamp);
+function mergeIncident(g) {
+  const now = Date.now(), k = incidentKey(g);
+  let x = null;
+  for (let i = 0; i < liveIncidents.length; i++) {
+    if (liveIncidents[i]._k === k) {               // le plus recent du meme groupe
+      if (now - liveIncidents[i]._t <= INCIDENT_MERGE_MS) x = liveIncidents.splice(i, 1)[0];
+      break;
+    }
+  }
+  if (x) {
+    x.conf = (x.conf == null || g.conf == null) ? (g.conf ?? x.conf)
+      : (x.conf * x.count + g.conf * g.count) / (x.count + g.count);
+    x.count += g.count;
+    x.last = g.last;
+    x.conflicts += g.conflicts;
+    g.ports.forEach(p => { if (!x.ports.includes(p) && x.ports.length < 5) x.ports.push(p); });
+    x.n_ports = Math.max(x.n_ports, g.n_ports, x.ports.length);
+    x._t = now;
+  } else {
+    x = { ...g, ports: g.ports.slice(), _k: k, _t: now };
+  }
+  liveIncidents.unshift(x);
+  if (liveIncidents.length > MAX_LIVE_INCIDENTS) liveIncidents.length = MAX_LIVE_INCIDENTS;
+  if (g.family !== "benign") pushBell(x);
+}
+
+function applyGroup(g) {
+  const fam = g.family;
+  counters.total += g.count;
+  counters[fam] = (counters[fam] || 0) + g.count;
+  const s = sources.get(g.src_ip) || { total: 0, anomal: 0 };
+  s.total += g.count;
+  if (fam !== "benign") s.anomal += g.count;
+  sources.set(g.src_ip, s);
+
+  const key = minuteKey(g.last);
   const bucket = timeline.get(key) || { benign: 0, scan: 0, ddos: 0, brute_force: 0 };
-  bucket[fam] = (bucket[fam] || 0) + 1;
+  bucket[fam] = (bucket[fam] || 0) + g.count;
   timeline.set(key, bucket);
   while (timeline.size > TIMELINE_MINUTES) timeline.delete(timeline.keys().next().value);
 
-  // Perf : on ne touche PAS au DOM ici. Pendant une attaque, des milliers
-  // d'enregistrements arrivent par seconde ; redessiner 7 graphiques pour
-  // chacun gelait l'onglet. Les donnees sont mises a jour ici, l'affichage
-  // est regroupe dans scheduleRender() (au plus 2 fois par seconde).
-  liveRecords.unshift(record);
-  if (liveRecords.length > 2000) liveRecords.length = 2000;
-  if (record.verdict === "anomal") pushBell(record, fam);
-  scheduleRender();
+  mergeIncident(g);   // aucun acces au DOM ici : l'affichage est regroupe dans scheduleRender()
 }
 
 function renderKpis() {
@@ -96,18 +135,17 @@ function scheduleRender() {
     renderSparklines();
     renderRecentAlerts();
     renderBell();
-    const pa = document.getElementById("page-alerts");
-    if (pa && !pa.classList.contains("hidden")) renderHistoryTable();
   }, 500);
 }
 
 // ============================================================
 // Cloche de notifications
 // ============================================================
-function pushBell(record, fam) {
-  bellItems.unshift({ record, fam });
+function pushBell(x) {
+  const i = bellItems.indexOf(x);
+  if (i >= 0) bellItems.splice(i, 1); else bellUnread += 1;   // meme incident : on le remonte, sans re-notifier
+  bellItems.unshift(x);
   if (bellItems.length > 8) bellItems.pop();
-  bellUnread += 1;
 }
 
 function renderBell() {
@@ -117,13 +155,13 @@ function renderBell() {
     badge.textContent = bellUnread > 9 ? "9+" : bellUnread;
     badge.classList.remove("hidden");
   }
-  document.getElementById("bell-list").innerHTML = bellItems.map(({ record: r, fam: f }) => `
+  document.getElementById("bell-list").innerHTML = bellItems.map(x => `
     <li class="py-1.5 border-b border-base-200 last:border-0">
       <div class="flex items-center justify-between">
-        <span class="font-medium">${r.src_ip}</span>
-        <span class="badge badge-sm" style="background:${FAMILY_COLOR[f]};color:white;border:none;">${f}</span>
+        <span class="font-medium">${x.src_ip}</span>
+        <span class="badge badge-sm" style="background:${FAMILY_COLOR[x.family]};color:white;border:none;">${x.family}</span>
       </div>
-      <div class="text-xs text-base-content/50">${r.dst_ip}:${r.dst_port} · ${r.fine_label || "?"}</div>
+      <div class="text-xs text-base-content/50">${destLabel(x, true)} · ${x.fine_label || "?"} · ×${x.count.toLocaleString("fr-FR")}</div>
     </li>`).join("");
 }
 document.getElementById("bell-label").addEventListener("click", () => {
@@ -132,34 +170,23 @@ document.getElementById("bell-label").addEventListener("click", () => {
 });
 
 // ============================================================
-// Flux en direct (regroupe l'affichage, jamais les compteurs)
+// Alertes recentes (tableau de bord) : incidents regroupes
 // ============================================================
-const feedEl = document.createElement("div"); // flux complet garde en memoire (pour page Alertes)
-function groupKey(r, fam) { return `${r.src_ip}|${fam}|${r.fine_label || ""}`; }
-const liveRecords = [];
-
-function renderFeedRow(record, fam) {
-  liveRecords.unshift(record);
-  if (liveRecords.length > 2000) liveRecords.pop();
-  renderRecentAlerts();
-  if (document.getElementById("page-alerts") && !document.getElementById("page-alerts").classList.contains("hidden")) {
-    renderHistoryTable();
-  }
-}
-
 function renderRecentAlerts() {
   const tbody = document.getElementById("recent-alerts-body");
-  const rows = liveRecords.slice(0, 8);
-  tbody.innerHTML = rows.map(r => {
-    const fam = familyOf(r);
-    return `<tr class="fade-in">
-      <td class="text-xs">${r.timestamp.slice(11, 19)}</td>
-      <td class="text-xs">${r.src_ip}:${r.src_port}</td>
-      <td class="text-xs">${r.dst_ip}:${r.dst_port}</td>
-      <td><span class="badge badge-sm" style="background:${FAMILY_COLOR[fam]};color:white;border:none;">${fam}</span></td>
-      <td class="text-xs">${r.fine_label || "--"}</td>
-    </tr>`;
-  }).join("");
+  const rows = liveIncidents.filter(x => x.family !== "benign").slice(0, 8);
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="6" class="text-center text-base-content/50 py-6">Aucune alerte récente.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map(x => `<tr>
+      <td class="text-xs">${x.last.slice(11, 19)}</td>
+      <td class="text-xs">${x.src_ip}</td>
+      <td class="text-xs">${destLabel(x, true)}</td>
+      <td><span class="badge badge-sm" style="background:${FAMILY_COLOR[x.family]};color:white;border:none;">${x.family}</span></td>
+      <td class="text-xs">${x.fine_label || "--"}</td>
+      <td class="text-xs">×${x.count.toLocaleString("fr-FR")}</td>
+    </tr>`).join("");
 }
 
 // ============================================================
@@ -250,56 +277,66 @@ function setStatus(state) {
 }
 async function loadInitial() {
   try {
-    const res = await fetch("/api/history?limit=300");
-    (await res.json()).forEach(applyRecord);
+    const res = await fetch("/api/prefill?limit=300");
+    (await res.json()).groups.forEach(applyGroup);
+    scheduleRender();
   } catch (e) { console.error(e); }
 }
 function connectStream() {
   const es = new EventSource("/api/stream");
   es.onopen = () => setStatus("live");
   es.onerror = () => setStatus("down");
-  es.onmessage = (ev) => { try { applyRecord(JSON.parse(ev.data)); } catch (e) {} };
+  es.onmessage = (ev) => {
+    try {
+      (JSON.parse(ev.data).groups || []).forEach(applyGroup);
+      scheduleRender();
+    } catch (e) {}
+  };
 }
 
 // ============================================================
 // Page Alertes
 // ============================================================
-let historyLoaded = false;
+let historyLoaded = false, historyBusy = false;
 let historyData = [];
 async function loadHistoryPage() {
   historyLoaded = true;
+  if (historyBusy) return;
+  historyBusy = true;
   try {
-    const res = await fetch("/api/history?limit=1000");
-    historyData = (await res.json()).reverse();
+    const res = await fetch("/api/incidents?limit=500");
+    historyData = await res.json();
     renderHistoryTable();
   } catch (e) {
-    document.getElementById("history-body").innerHTML = `<tr><td colspan="7">Historique indisponible.</td></tr>`;
+    document.getElementById("history-body").innerHTML = `<tr><td colspan="8">Historique indisponible.</td></tr>`;
+  } finally {
+    historyBusy = false;
   }
 }
 function filteredHistory() {
   const search = document.getElementById("hist-search").value.trim().toLowerCase();
   const famFilter = document.getElementById("hist-family").value;
-  const merged = [...liveRecords, ...historyData];
-  return merged.filter(r => {
-    if (search && !r.src_ip.toLowerCase().includes(search)) return false;
-    if (famFilter && familyOf(r) !== famFilter) return false;
+  return historyData.filter(x => {
+    if (search && !x.src_ip.toLowerCase().includes(search)) return false;
+    if (famFilter && x.family !== famFilter) return false;
     return true;
-  }).slice(0, 500);
+  });
 }
 function renderHistoryTable() {
   const rows = filteredHistory();
   const tbody = document.getElementById("history-body");
-  if (!rows.length) { tbody.innerHTML = `<tr><td colspan="7" class="text-center text-base-content/50 py-8">Aucun résultat.</td></tr>`; return; }
-  tbody.innerHTML = rows.map(r => {
-    const fam = familyOf(r);
-    const conf = r.verdict === "anomal" && r.family_confidence ? (r.family_confidence * 100).toFixed(1) + "%" : "--";
-    const conflict = r.family_fine_conflict ? `<span class="tooltip" data-tip="Désaccord entre modèles">⚠️</span>` : "";
+  if (!rows.length) { tbody.innerHTML = `<tr><td colspan="8" class="text-center text-base-content/50 py-8">Aucun résultat.</td></tr>`; return; }
+  tbody.innerHTML = rows.map(x => {
+    const conf = x.conf != null ? (x.conf * 100).toFixed(1) + "%" : "--";
+    const conflict = x.conflicts ? `<span class="tooltip" data-tip="Désaccord entre modèles (${x.conflicts} flux)">⚠️</span>` : "";
+    const range = `${x.first.slice(11, 19)} → ${x.last.slice(11, 19)}`;
     return `<tr>
-      <td class="text-xs">${r.timestamp.slice(11, 19)}</td>
-      <td class="text-xs">${r.src_ip}:${r.src_port}</td>
-      <td class="text-xs">${r.dst_ip}:${r.dst_port}</td>
-      <td><span class="badge badge-sm" style="background:${FAMILY_COLOR[fam]};color:white;border:none;">${fam}</span></td>
-      <td class="text-xs">${r.fine_label || "--"}</td>
+      <td class="text-xs" title="${range}">${x.last.slice(11, 19)}</td>
+      <td class="text-xs">${x.src_ip}</td>
+      <td class="text-xs">${destLabel(x, false)}</td>
+      <td><span class="badge badge-sm" style="background:${FAMILY_COLOR[x.family]};color:white;border:none;">${x.family}</span></td>
+      <td class="text-xs">${x.fine_label || "--"}</td>
+      <td class="text-xs">×${x.count.toLocaleString("fr-FR")}</td>
       <td class="text-xs">${conf}</td>
       <td>${conflict}</td>
     </tr>`;
@@ -310,10 +347,11 @@ document.getElementById("hist-family").addEventListener("change", renderHistoryT
 document.getElementById("hist-refresh").addEventListener("click", loadHistoryPage);
 document.getElementById("hist-export").addEventListener("click", () => {
   const rows = filteredHistory();
-  const header = ["timestamp", "src_ip", "src_port", "dst_ip", "dst_port", "family", "fine_label", "family_confidence", "fine_confidence"];
-  const csv = [header.join(",")].concat(rows.map(r => header.map(h => {
-    const v = h === "family" ? familyOf(r) : (r[h] ?? "");
-    return `"${String(v).replace(/"/g, '""')}"`;
+  const header = ["debut", "fin", "src_ip", "dst_ip", "nb_ports", "family", "fine_label", "nb_flux", "confiance_moy"];
+  const val = (x, h) => ({ debut: x.first, fin: x.last, src_ip: x.src_ip, dst_ip: x.dst_ip, nb_ports: x.n_ports,
+    family: x.family, fine_label: x.fine_label, nb_flux: x.count, confiance_moy: x.conf ?? "" })[h];
+  const csv = [header.join(",")].concat(rows.map(x => header.map(h => {
+    return `"${String(val(x, h)).replace(/"/g, '""')}"`;
   }).join(","))).join("\n");
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
@@ -322,6 +360,11 @@ document.getElementById("hist-export").addEventListener("click", () => {
   a.click();
   URL.revokeObjectURL(url);
 });
+// La page Alertes se met a jour toute seule (toutes les 5 s) tant qu'elle est affichee.
+setInterval(() => {
+  const pa = document.getElementById("page-alerts");
+  if (historyLoaded && pa && !pa.classList.contains("hidden")) loadHistoryPage();
+}, 5000);
 
 // ============================================================
 // Page Performance du modele

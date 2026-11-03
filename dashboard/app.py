@@ -26,7 +26,10 @@ import ipaddress
 import json
 import os
 import secrets
+import threading
 import time
+from collections import deque
+from datetime import datetime
 
 import psutil
 from flask import (Flask, Response, jsonify, redirect, request,
@@ -92,17 +95,237 @@ def whoami():
     return jsonify({"username": session.get("username", "?")})
 
 
-@app.route("/api/history")
-def history():
-    """Les N dernieres detections, pour que le dashboard ne soit pas vide
-    a l'ouverture (avant la prochaine detection en direct)."""
-    limit = int(request.args.get("limit", "300"))
-    if not os.path.exists(LOG_PATH):
-        return jsonify([])
-    with open(LOG_PATH, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+# ============================================================
+# AGREGATION DES FLUX
+# ============================================================
+# Le dashboard n'a pas besoin de chaque flux : il a besoin de savoir QUI
+# attaque QUOI, combien de fois et QUAND. Pendant un flood, des dizaines de
+# milliers de flux arrivent par seconde ; les envoyer un par un gelait le
+# navigateur et noyait l'ecran de lignes identiques. Le journal complet
+# (detections_v6.jsonl) reste intact : seul l'affichage est regroupe.
+INCIDENT_GAP_S = 10         # au-dela de 10 s sans nouveau flux, le groupe est clos
+MAX_SAMPLE_PORTS = 5        # ports de destination cites en exemple
+MAX_GROUPS_PER_TICK = 300   # garde-fou : au-dela, on regroupe par source seulement
+STREAM_TICK_S = 0.5         # un envoi toutes les 0,5 s : reste "temps reel"
+MAX_HISTORY = 5000
+
+
+def family_of(r: dict) -> str:
+    return "benign" if r.get("verdict") == "benign" else (r.get("family_label") or "ddos")
+
+
+def _group_key(r: dict, coarse: bool = False) -> tuple:
+    fam = family_of(r)
+    if fam == "benign":
+        return (r.get("src_ip", ""), "", "benign", "")
+    return (r.get("src_ip", ""), "" if coarse else r.get("dst_ip", ""), fam, r.get("fine_label") or "")
+
+
+def _new_group(key: tuple, r: dict) -> dict:
+    ts = r.get("timestamp", "")
+    return {"src_ip": key[0], "dst_ip": key[1], "family": key[2], "fine_label": key[3],
+            "count": 0, "ports": [], "n_ports": 0, "first": ts, "last": ts,
+            "conf_sum": 0.0, "conflicts": 0, "_ports": set()}
+
+
+def _add(g: dict, r: dict) -> None:
+    g["count"] += 1
+    g["last"] = r.get("timestamp", g["last"])
+    if g["family"] == "benign":
+        return
+    g["conf_sum"] += r.get("family_confidence") or 0
+    g["conflicts"] += bool(r.get("family_fine_conflict"))
+    port = r.get("dst_port")
+    if port is not None and port not in g["_ports"]:
+        g["_ports"].add(port)
+        if len(g["ports"]) < MAX_SAMPLE_PORTS:
+            g["ports"].append(port)
+
+
+def _finish(g: dict) -> dict:
+    g["n_ports"] = len(g.pop("_ports"))
+    conf_sum = g.pop("conf_sum")
+    g["conf"] = round(conf_sum / g["count"], 4) if g["family"] != "benign" and g["count"] else None
+    return g
+
+
+def group_records(records: list, coarse: bool = False) -> list:
+    """Regroupe des enregistrements par (source, cible, famille, type).
+    Les flux benins sont regroupes par source seulement."""
+    groups: dict = {}
+    for r in records:
+        key = _group_key(r, coarse)
+        g = groups.get(key)
+        if g is None:
+            g = groups[key] = _new_group(key, r)
+        _add(g, r)
+    return [_finish(g) for g in groups.values()]
+
+
+def _epoch(ts: str, default: float = 0.0) -> float:
+    try:
+        return datetime.fromisoformat(ts).timestamp()
+    except (ValueError, TypeError):
+        return default
+
+
+def build_incidents(records: list, gap_s: float = INCIDENT_GAP_S) -> list:
+    """Comme group_records, mais un groupe est clos des qu'il reste silencieux
+    plus de gap_s : une meme source qui attaque a 10 h puis a 14 h donne deux
+    incidents distincts. Renvoie les incidents du plus recent au plus ancien."""
+    incidents, open_ = [], {}
+    last_t = 0.0
+    for r in records:
+        t = _epoch(r.get("timestamp", ""), last_t)
+        last_t = t
+        key = _group_key(r)
+        g = open_.get(key)
+        if g is None or t - g["_t"] > gap_s:
+            g = open_[key] = _new_group(key, r)
+            incidents.append(g)
+        g["_t"] = t
+        _add(g, r)
+    for g in incidents:
+        g.pop("_t", None)
+        _finish(g)
+    incidents.sort(key=lambda g: g["last"], reverse=True)
+    return incidents
+
+
+class IncidentStore:
+    """Registre des incidents, tenu a jour EN CONTINU par un thread qui suit le
+    journal (comme le fait le flux SSE). La page Alertes n'a plus a relire et
+    re-analyser des dizaines de milliers de lignes : elle lit ce registre, et un
+    flood de 100 000 flux apparait en entier (x100 000), pas tronque.
+
+    Memoire bornee : 2000 incidents d'alerte et 500 incidents benins au plus."""
+
+    def __init__(self, path: str, gap_s: float = INCIDENT_GAP_S, bootstrap_bytes: int = 64 * 1024 * 1024,
+                 max_alerts: int = 2000, max_benign: int = 500) -> None:
+        self.path, self.gap_s, self.bootstrap_bytes = path, gap_s, bootstrap_bytes
+        self.alerts: deque = deque(maxlen=max_alerts)
+        self.benign: deque = deque(maxlen=max_benign)
+        self.open: dict = {}
+        self.offset = 0
+        self.last_t = 0.0
+        self.lock = threading.Lock()
+
+    # -- alimentation ---------------------------------------------------
+    def add(self, records: list) -> None:
+        with self.lock:
+            for r in records:
+                t = _epoch(r.get("timestamp", ""), self.last_t)
+                self.last_t = t
+                key = _group_key(r)
+                g = self.open.get(key)
+                if g is None or t - g["_t"] > self.gap_s:
+                    g = self.open[key] = _new_group(key, r)
+                    (self.benign if g["family"] == "benign" else self.alerts).append(g)
+                g["_t"] = t
+                _add(g, r)
+            # les groupes silencieux depuis plus de gap_s sont clos : on les oublie
+            if len(self.open) > 1000:
+                limit = self.last_t - self.gap_s
+                self.open = {k: g for k, g in self.open.items() if g["_t"] >= limit}
+
+    def _read_new(self) -> None:
+        try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            return
+        if size < self.offset:                 # journal tronque / recree (logrotate)
+            self.offset = 0
+        if size == self.offset:
+            return
+        with open(self.path, "rb") as f:
+            f.seek(self.offset)
+            chunk = f.read(size - self.offset)
+        last_nl = chunk.rfind(b"\n")
+        if last_nl == -1:
+            return                             # ligne encore incomplete
+        self.offset += last_nl + 1
+        self.add(parse_lines(chunk[:last_nl].split(b"\n")))
+
+    def bootstrap(self) -> None:
+        """Au demarrage : reconstruit les incidents recents depuis la fin du journal."""
+        try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            return
+        self.offset = max(0, size - self.bootstrap_bytes)
+        if self.offset:                        # on tombe au milieu d'une ligne : on saute jusqu'au \n suivant
+            with open(self.path, "rb") as f:
+                f.seek(self.offset)
+                skip = f.read(1 << 16).find(b"\n")
+            self.offset += skip + 1 if skip != -1 else 0
+        while True:                            # lit par tranches de 32 Mo pour borner la memoire
+            before = self.offset
+            end = min(size, self.offset + 32 * 1024 * 1024)
+            with open(self.path, "rb") as f:
+                f.seek(before)
+                chunk = f.read(end - before)
+            last_nl = chunk.rfind(b"\n")
+            if last_nl == -1:
+                break
+            self.offset = before + last_nl + 1
+            self.add(parse_lines(chunk[:last_nl].split(b"\n")))
+            if self.offset >= size:
+                break
+
+    def start(self) -> None:
+        def loop() -> None:
+            while not os.path.exists(self.path):
+                time.sleep(1)
+            self.bootstrap()
+            while True:
+                try:
+                    self._read_new()
+                except Exception as exc:       # ne jamais tuer le thread
+                    print(f"[dashboard] registre d'incidents : {exc}")
+                time.sleep(STREAM_TICK_S)
+        threading.Thread(target=loop, daemon=True).start()
+
+    # -- lecture --------------------------------------------------------
+    def snapshot(self, limit: int = 500) -> list:
+        with self.lock:
+            out = []
+            for g in list(self.alerts) + list(self.benign):
+                c = dict(g)
+                c.pop("_t", None)
+                c["ports"] = list(g["ports"])
+                c["n_ports"] = len(c.pop("_ports"))
+                conf_sum = c.pop("conf_sum")
+                c["conf"] = round(conf_sum / c["count"], 4) if c["family"] != "benign" and c["count"] else None
+                out.append(c)
+        out.sort(key=lambda x: x["last"], reverse=True)
+        return out[:limit]
+
+
+INCIDENTS: "IncidentStore | None" = None
+
+
+def tail_lines(path: str, n: int, block: int = 262144) -> list:
+    """Les n dernieres lignes SANS relire tout le fichier (le journal grossit
+    sans arret : readlines() finissait par saturer la memoire)."""
+    chunks, newlines = [], 0
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        while pos > 0 and newlines <= n:
+            step = min(block, pos)
+            pos -= step
+            f.seek(pos)
+            part = f.read(step)
+            chunks.append(part)
+            newlines += part.count(b"\n")
+    return b"".join(reversed(chunks)).splitlines()[-n:]
+
+
+def parse_lines(lines) -> list:
     records = []
-    for line in lines[-limit:]:
+    for line in lines:
+        if isinstance(line, bytes):
+            line = line.decode("utf-8", errors="ignore")
         line = line.strip()
         if not line:
             continue
@@ -110,7 +333,42 @@ def history():
             records.append(json.loads(line))
         except json.JSONDecodeError:
             continue
-    return jsonify(records)
+    return records
+
+
+def _int_arg(name: str, default: int, maximum: int) -> int:
+    try:
+        return max(1, min(int(request.args.get(name, default)), maximum))
+    except ValueError:
+        return default
+
+
+def _tail_records(n: int) -> list:
+    if not os.path.exists(LOG_PATH):
+        return []
+    return parse_lines(tail_lines(LOG_PATH, n))
+
+
+@app.route("/api/history")
+def history():
+    """Les N dernieres detections, flux par flux (export, outils externes)."""
+    return jsonify(_tail_records(_int_arg("limit", 300, MAX_HISTORY)))
+
+
+@app.route("/api/prefill")
+def prefill():
+    """Etat initial du tableau de bord : les N derniers flux, deja regroupes."""
+    return jsonify({"groups": group_records(_tail_records(_int_arg("limit", 300, MAX_HISTORY)))})
+
+
+@app.route("/api/incidents")
+def incidents():
+    """Page Alertes : les incidents recents (flux regroupes), pas les flux bruts.
+    ?limit = nombre d'incidents renvoyes (500 par defaut)."""
+    limit = _int_arg("limit", 500, 2000)
+    if INCIDENTS is not None:
+        return jsonify(INCIDENTS.snapshot(limit))
+    return jsonify(build_incidents(_tail_records(20000))[:limit])   # repli (sans thread de suivi)
 
 
 # ============================================================
@@ -289,18 +547,25 @@ def metrics():
         return jsonify(json.load(f))
 
 
+def aggregate_tick(lines) -> dict | None:
+    """Transforme les nouvelles lignes du journal en UN message regroupe."""
+    records = parse_lines(lines)
+    if not records:
+        return None
+    groups = group_records(records)
+    if len(groups) > MAX_GROUPS_PER_TICK:      # ex. scan sur des milliers de cibles
+        groups = group_records(records, coarse=True)
+    return {"n": len(records), "groups": groups}
+
+
 @app.route("/api/stream")
 def stream():
-    """Flux SSE : envoie chaque nouvelle ligne du journal des qu'elle est
-    ecrite par le detecteur (un AUTRE processus).
-
-    On ROUVRE le fichier a chaque sondage plutot que de garder un handle
-    ouvert en continu : sur Windows en particulier, un handle garde ouvert
-    pendant qu'un autre processus ecrit dans le meme fichier peut ne pas
-    voir les nouvelles donnees de facon fiable. On travaille en octets
-    pour ne consommer que les lignes COMPLETES (pas de JSON tronque si on
-    lit pendant une ecriture en cours).
-    """
+    """Flux SSE : toutes les 0,5 s, UN message qui resume les flux detectes
+    depuis le precedent (compteurs exacts, mais regroupes par source/cible/
+    type). Le detecteur est un AUTRE processus : on rouvre le fichier a chaque
+    sondage plutot que de garder un handle ouvert (fiable meme si un autre
+    processus ecrit dedans), et on travaille en octets pour ne consommer que
+    les lignes COMPLETES (jamais de JSON tronque)."""
 
     def generate():
         while not os.path.exists(LOG_PATH):
@@ -317,29 +582,29 @@ def stream():
             if size < offset:
                 offset = 0  # fichier recree/tronque -> on repart de zero
 
+            msg = None
             if size > offset:
                 with open(LOG_PATH, "rb") as f:
                     f.seek(offset)
                     chunk = f.read()
                 last_nl = chunk.rfind(b"\n")
                 if last_nl != -1:
-                    complete = chunk[:last_nl].decode("utf-8", errors="ignore")
                     offset += last_nl + 1
-                    for line in complete.split("\n"):
-                        line = line.strip()
-                        if line:
-                            yield f"data: {line}\n\n"
+                    msg = aggregate_tick(chunk[:last_nl].split(b"\n"))
+
+            if msg:
+                yield f"data: {json.dumps(msg, separators=(',', ':'))}\n\n"
             else:
                 yield ": keep-alive\n\n"
 
-            time.sleep(0.5)
+            time.sleep(STREAM_TICK_S)
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream",
                      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 def main() -> None:
-    global LOG_PATH, MODELS_DIR, CONFIG_DIR, ADMIN_USER, ADMIN_HASH
+    global LOG_PATH, MODELS_DIR, CONFIG_DIR, ADMIN_USER, ADMIN_HASH, INCIDENTS
     ap = argparse.ArgumentParser(description="Dashboard NIDS temps reel")
     ap.add_argument("--log", default="detections_v6.jsonl",
                      help="chemin vers le journal ecrit par realtime_detector_v6.py")
@@ -363,6 +628,8 @@ def main() -> None:
     password = args.admin_password or getpass.getpass("Mot de passe admin du dashboard : ")
     ADMIN_HASH = generate_password_hash(password)
 
+    INCIDENTS = IncidentStore(LOG_PATH)
+    INCIDENTS.start()
     print(f"[dashboard] journal surveille : {os.path.abspath(LOG_PATH)}")
     print(f"[dashboard] compte admin      : {ADMIN_USER}")
     print(f"[dashboard] ouvre http://{args.host}:{args.port} dans ton navigateur")
