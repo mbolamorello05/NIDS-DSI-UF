@@ -5,18 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>NIDS -- Dashboard</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>%F0%9F%9B%A1%EF%B8%8F</text></svg>" />
-  <!-- Bibliotheques servies localement (static/vendor) : le dashboard fonctionne
-       sans acces Internet. Voir static/vendor/README.md pour les versions. -->
-  <link href="/static/vendor/daisyui.min.css" rel="stylesheet" type="text/css" />
-  <script src="/static/vendor/chart.umd.js"></script>
-  <script src="/static/vendor/lucide.min.js"></script>
+  <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.10/dist/full.min.css" rel="stylesheet" type="text/css" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js"></script>
   <style>
     .nav-item.active { background: hsl(var(--p)); color: hsl(var(--pc)); font-weight: 600; }
     .feed-row { border-left-width: 3px; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
     .fade-in { animation: fadeIn .35s ease both; }
   </style>
-  <link href="/static/vendor/tailwind.css" rel="stylesheet" />
 </head>
 <body class="bg-base-200">
   <div class="drawer lg:drawer-open">
@@ -135,7 +133,7 @@
                 </div>
                 <div class="overflow-x-auto">
                   <table class="table table-sm">
-                    <thead><tr><th>Heure</th><th>Source</th><th>Destination</th><th>Famille</th><th>Type</th><th>Flux</th></tr></thead>
+                    <thead><tr><th>Heure</th><th>Source</th><th>Destination</th><th>Famille</th><th>Type</th></tr></thead>
                     <tbody id="recent-alerts-body"></tbody>
                   </table>
                 </div>
@@ -184,7 +182,7 @@
               </div>
               <div class="overflow-x-auto max-h-[650px] overflow-y-auto">
                 <table class="table table-sm table-pin-rows">
-                  <thead><tr><th>Heure</th><th>Source</th><th>Destination</th><th>Famille</th><th>Type</th><th>Flux</th><th>Confiance</th><th></th></tr></thead>
+                  <thead><tr><th>Heure</th><th>Source</th><th>Destination</th><th>Famille</th><th>Type</th><th>Confiance</th><th></th></tr></thead>
                   <tbody id="history-body"></tbody>
                 </table>
               </div>
