@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import ipaddress
 import json
 import os
 import secrets
@@ -33,6 +34,7 @@ from flask import (Flask, Response, jsonify, redirect, request,
 from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.secret_key = secrets.token_hex(32)  # regenere a chaque demarrage -> sessions reinitialisees
 
 LOG_PATH = "detections_v6.jsonl"  # ecrase par --log au demarrage
@@ -109,6 +111,112 @@ def history():
         except json.JSONDecodeError:
             continue
     return jsonify(records)
+
+
+# ============================================================
+# PREVENTION : le dashboard LIT l'etat ecrit par le responder (blocks.json,
+# response_events.jsonl, responder_status.json) et lui DEPOSE des ordres (un
+# petit fichier JSON par ordre dans config/commands/). Il ne touche jamais au
+# pare-feu lui-meme : le responder reste le seul a avoir NET_ADMIN, et l'admin
+# n'a jamais besoin d'ouvrir une console.
+# ============================================================
+RESPONDER_ALIVE_S = 8        # statut plus vieux que ca = responder arrete
+MODES = ("off", "dry-run", "enforce")
+PROFILES = ("demo", "strict")
+
+
+def _data_dir() -> str:
+    return os.path.dirname(os.path.abspath(LOG_PATH))
+
+
+def _read_json_file(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def _tail_events(path: str, n: int) -> list:
+    """Les n derniers evenements du responder, du plus recent au plus ancien."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 512 * 1024))      # 512 Ko suffisent pour des centaines d'evenements
+            data = f.read()
+    except OSError:
+        return []
+    out = []
+    for line in data.splitlines()[-n:]:
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    out.reverse()
+    return out
+
+
+@app.route("/api/prevention")
+def prevention():
+    now = time.time()
+    status = _read_json_file(os.path.join(_data_dir(), "responder_status.json"), None)
+    age = (now - status["ts"]) if status and "ts" in status else None
+    responder = dict(status or {})
+    responder.pop("ts", None)
+    responder["alive"] = age is not None and age < RESPONDER_ALIVE_S
+    responder["age_s"] = None if age is None else round(age, 1)
+
+    blocks = []
+    state = _read_json_file(os.path.join(_data_dir(), "blocks.json"), {})
+    for ip, b in (state.get("blocks") or {}).items():
+        if b.get("until", 0) <= now:
+            continue                                # expire : le responder le purgera
+        blocks.append({"ip": ip, "family": b.get("family"), "fine": b.get("fine"),
+                       "since": b["since"], "until": b["until"],
+                       "duration_s": round(b["until"] - b["since"]),
+                       "remaining_s": round(b["until"] - now), "dry_run": bool(b.get("dry_run"))})
+    blocks.sort(key=lambda x: x["since"], reverse=True)
+
+    try:
+        pending = len([n for n in os.listdir(os.path.join(CONFIG_DIR, "commands")) if n.endswith(".json")])
+    except OSError:
+        pending = 0
+    return jsonify({"now": now, "responder": responder, "blocks": blocks, "pending": pending,
+                    "events": _tail_events(os.path.join(_data_dir(), "response_events.jsonl"), 300)})
+
+
+@app.route("/api/prevention/command", methods=["POST"])
+def prevention_command():
+    """Depose un ordre pour le responder. Exige un corps JSON (Content-Type
+    application/json) : un formulaire venu d'un autre site ne peut pas en envoyer."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "corps JSON attendu"}), 400
+    kind, value = data.get("cmd"), data.get("value")
+    if kind == "set_mode" and value in MODES:
+        payload = {"cmd": kind, "value": value}
+    elif kind == "set_profile" and value in PROFILES:
+        payload = {"cmd": kind, "value": value}
+    elif kind == "unblock":
+        try:
+            payload = {"cmd": kind, "ip": str(ipaddress.ip_address(str(data.get("ip", "")).strip()))}
+        except ValueError:
+            return jsonify({"ok": False, "error": "adresse IP invalide"}), 400
+    elif kind == "unblock_all":
+        payload = {"cmd": kind}
+    else:
+        return jsonify({"ok": False, "error": "ordre invalide"}), 400
+
+    payload["source"] = "dashboard"
+    cmd_dir = os.path.join(CONFIG_DIR, "commands")
+    os.makedirs(cmd_dir, exist_ok=True)
+    final = os.path.join(cmd_dir, f"{time.time_ns()}-{secrets.token_hex(3)}.json")
+    tmp = os.path.join(cmd_dir, "." + os.path.basename(final)[:-5] + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:     # ecriture atomique : le responder ne lit jamais un ordre a moitie ecrit
+        json.dump(payload, f, ensure_ascii=False)
+    os.replace(tmp, final)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/system")

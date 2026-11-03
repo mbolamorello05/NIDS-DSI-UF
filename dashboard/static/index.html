@@ -195,6 +195,101 @@
           <div id="perf-content"><div class="text-center text-base-content/50 py-16">Chargement des métriques...</div></div>
         </section>
 
+        <!-- ---------- Prévention ---------- -->
+        <section id="page-prevention" class="page hidden space-y-6">
+          <div id="prev-banner" class="space-y-2"></div>
+
+          <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+            <div class="card bg-base-100 shadow fade-in xl:col-span-2">
+              <div class="card-body">
+                <h2 class="card-title text-base">Réponse automatique</h2>
+                <div>
+                  <div class="text-sm font-medium mb-2">Mode</div>
+                  <div class="flex flex-wrap gap-2" id="prev-mode-btns">
+                    <button class="btn btn-sm btn-outline" data-mode="off">Désactivé</button>
+                    <button class="btn btn-sm btn-outline" data-mode="dry-run">Simulation</button>
+                    <button class="btn btn-sm btn-outline" data-mode="enforce">Blocage actif</button>
+                  </div>
+                  <p id="prev-mode-help" class="text-xs text-base-content/60 mt-2">Chargement...</p>
+                </div>
+                <div class="mt-3">
+                  <div class="text-sm font-medium mb-2">Durée des blocages</div>
+                  <div class="flex flex-wrap gap-2" id="prev-profile-btns">
+                    <button class="btn btn-sm btn-outline" data-profile="demo">Démo</button>
+                    <button class="btn btn-sm btn-outline" data-profile="strict">Production</button>
+                  </div>
+                  <p id="prev-profile-help" class="text-xs text-base-content/60 mt-2"></p>
+                </div>
+              </div>
+            </div>
+            <div class="card bg-base-100 shadow fade-in">
+              <div class="card-body">
+                <h2 class="card-title text-base">État</h2>
+                <div class="space-y-3 mt-1">
+                  <div class="flex items-center justify-between"><span class="text-sm text-base-content/70">Service de prévention</span><span id="prev-kpi-resp" class="badge badge-sm">--</span></div>
+                  <div class="flex items-center justify-between"><span class="text-sm text-base-content/70">IP bloquées (actives)</span><span id="prev-kpi-active" class="text-xl font-bold">0</span></div>
+                  <div class="flex items-center justify-between"><span class="text-sm text-base-content/70">Blocages simulés</span><span id="prev-kpi-sim" class="text-xl font-bold">0</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card bg-base-100 shadow fade-in">
+            <div class="card-body">
+              <div class="flex items-center justify-between flex-wrap gap-2">
+                <h2 class="card-title text-base">IP bloquées</h2>
+                <button id="prev-unblock-all" class="btn btn-sm btn-outline btn-error">Tout débloquer</button>
+              </div>
+              <div class="overflow-x-auto">
+                <table class="table table-sm">
+                  <thead><tr><th>IP</th><th>Famille</th><th>Type</th><th>Depuis (UTC)</th><th>Durée</th><th>Temps restant</th><th>Statut</th><th></th></tr></thead>
+                  <tbody id="prev-blocks-body"></tbody>
+                </table>
+              </div>
+              <div class="text-xs text-base-content/50">Un blocage est toujours temporaire et se lève tout seul. Si une IP débloquée continue son attaque, elle sera de nouveau bloquée.</div>
+            </div>
+          </div>
+
+          <div class="card bg-base-100 shadow fade-in">
+            <div class="card-body">
+              <div class="flex items-center justify-between flex-wrap gap-2">
+                <h2 class="card-title text-base">Journal des décisions</h2>
+                <label class="label cursor-pointer gap-2 py-0">
+                  <span class="label-text text-xs">Inclure les alertes sans blocage</span>
+                  <input type="checkbox" id="prev-events-quiet" class="checkbox checkbox-sm" />
+                </label>
+              </div>
+              <div class="overflow-x-auto">
+                <table class="table table-sm">
+                  <thead><tr><th>Heure (UTC)</th><th>Événement</th><th>IP</th><th>Famille / type</th><th>Détail</th></tr></thead>
+                  <tbody id="prev-events-body"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 xl:grid-cols-2 gap-6">
+            <div class="card bg-base-100 shadow fade-in">
+              <div class="card-body">
+                <h2 class="card-title text-base">Règles appliquées</h2>
+                <div class="overflow-x-auto">
+                  <table class="table table-sm">
+                    <thead><tr><th>Famille</th><th>Réponse</th></tr></thead>
+                    <tbody id="prev-rules-body"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+            <div class="card bg-base-100 shadow fade-in">
+              <div class="card-body">
+                <h2 class="card-title text-base">IP protégées</h2>
+                <div class="text-xs text-base-content/60">Jamais bloquées : le serveur lui-même, sa passerelle, ses DNS et la liste blanche.</div>
+                <div id="prev-allow" class="flex flex-wrap content-start items-start gap-2 mt-2"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
         <!-- ---------- Paramètres ---------- -->
         <section id="page-settings" class="page hidden space-y-6">
           <div class="card bg-base-100 shadow fade-in">
@@ -214,8 +309,8 @@
               <h2 class="card-title text-base">Interface réseau à surveiller</h2>
               <p class="text-sm text-base-content/60 mb-2">
                 Liste générée par le détecteur lui-même (le dashboard, en conteneur, ne voit
-                pas les vraies cartes réseau de l'hôte). Le changement s'applique au
-                <strong>prochain démarrage</strong> du détecteur, pas à chaud.
+                pas les vraies cartes réseau de l'hôte). Le détecteur redémarre tout seul
+                sur la nouvelle interface (quelques secondes, sans intervention).
               </p>
               <div id="iface-content">
                 <div class="text-base-content/50 text-sm">Chargement...</div>
@@ -246,6 +341,7 @@
         <ul class="menu px-3 gap-1 text-sm">
           <li><button data-page="dashboard" class="nav-item active rounded-lg"><i data-lucide="layout-dashboard" class="w-4 h-4"></i> Tableau de bord</button></li>
           <li><button data-page="alerts" class="nav-item rounded-lg"><i data-lucide="shield-alert" class="w-4 h-4"></i> Alertes</button></li>
+          <li><button data-page="prevention" class="nav-item rounded-lg"><i data-lucide="shield-ban" class="w-4 h-4"></i> Prévention <span id="prev-badge" class="badge badge-sm badge-error ml-auto hidden">0</span></button></li>
           <li><button data-page="performance" class="nav-item rounded-lg"><i data-lucide="line-chart" class="w-4 h-4"></i> Performance du modèle</button></li>
           <li><button data-page="settings" class="nav-item rounded-lg"><i data-lucide="settings" class="w-4 h-4"></i> Paramètres</button></li>
         </ul>

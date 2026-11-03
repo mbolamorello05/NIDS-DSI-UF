@@ -4,7 +4,7 @@
 const MAX_FEED_ROWS = 300;
 const TIMELINE_MINUTES = 30;
 const GROUP_WINDOW_MS = 3000;
-const PAGE_TITLES = { dashboard: "Tableau de bord", alerts: "Alertes", performance: "Performance du modèle", settings: "Paramètres" };
+const PAGE_TITLES = { dashboard: "Tableau de bord", alerts: "Alertes", performance: "Performance du modèle", prevention: "Prévention", settings: "Paramètres" };
 const FAMILY_COLOR = { benign: "#16a34a", scan: "#f59e0b", ddos: "#ef4444", brute_force: "#a855f7" };
 
 // ============================================================
@@ -34,6 +34,7 @@ function showPage(name) {
   document.getElementById("page-title").textContent = PAGE_TITLES[name];
   if (name === "performance" && !perfLoaded) loadPerformance();
   if (name === "alerts" && !historyLoaded) loadHistoryPage();
+  if (name === "prevention") loadPrevention();
   if (name === "settings") { loadConfig(); loadInterfaces(); }
 }
 document.querySelectorAll("[data-page]").forEach(btn => btn.addEventListener("click", () => showPage(btn.dataset.page)));
@@ -498,6 +499,235 @@ async function pollSystem() {
 }
 
 // ============================================================
+// Prevention : IP bloquees, journal des decisions, reglages (mode / profil)
+// et deblocage. Le dashboard n'agit jamais sur le pare-feu : il depose des
+// ordres que le responder execute (voir /api/prevention/command).
+// ============================================================
+const EVENT_LABEL = {
+  block: ["Bloquée", "badge-error"], would_block: ["Simulée", "badge-warning"], expired: ["Expirée", "badge-success"],
+  unblock: ["Débloquée", "badge-info"], config: ["Réglage", "badge-primary"], alert_only: ["Alerte seule", "badge-ghost"],
+  skip_allowlist: ["Protégée", "badge-ghost"], circuit_breaker: ["Disjoncteur", "badge-error"], error: ["Erreur", "badge-error"],
+};
+const QUIET_EVENTS = ["alert_only", "skip_allowlist"];
+const MODE_INFO = {
+  "off": { label: "Désactivé", help: "Aucune réponse : le responder ne fait rien." },
+  "dry-run": { label: "Simulation", help: "Le responder journalise ce qu'il bloquerait, sans rien bloquer." },
+  "enforce": { label: "Blocage actif", help: "Les IP détectées comme malveillantes sont réellement bloquées sur le serveur, temporairement." },
+};
+const PROFILE_INFO = {
+  demo: { label: "Démo", help: "Blocage court, sans escalade : on peut rejouer des attaques depuis la même machine sans l'exclure durablement." },
+  strict: { label: "Production", help: "Exclusion plus sévère : la durée double à chaque récidive de la même IP, jusqu'au plafond." },
+};
+let prevData = null, prevSkew = 0, prevBusy = false, prevTick = 0;
+
+function escapeHtml(v) {
+  return String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function fmtDur(sec) {
+  sec = Math.max(0, Math.round(sec));
+  if (sec < 60) return `${sec} s`;
+  const m = Math.floor(sec / 60), r = sec % 60;
+  if (m < 60) return r ? `${m} min ${r} s` : `${m} min`;
+  const h = Math.floor(m / 60), mm = m % 60;
+  return mm ? `${h} h ${mm} min` : `${h} h`;
+}
+function utcTime(x) {
+  const d = new Date(x);
+  return isNaN(d) ? "--" : d.toISOString().slice(11, 19);
+}
+function famBadge(f) {
+  return f ? `<span class="badge badge-sm" style="background:${FAMILY_COLOR[f] || "#6b7280"};color:white;border:none;">${escapeHtml(f)}</span>` : "--";
+}
+function showToast(msg, kind = "info") {
+  let box = document.getElementById("toast-box");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "toast-box";
+    box.className = "toast toast-end z-50";
+    document.body.appendChild(box);
+  }
+  const el = document.createElement("div");
+  el.className = `alert alert-${kind} text-sm py-2`;
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
+async function prevCommand(body, okMsg) {
+  try {
+    const res = await fetch("/api/prevention/command", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok || !j.ok) { showToast(j.error || "Ordre refusé", "error"); return false; }
+    showToast(okMsg || "Ordre envoyé", "success");
+    setTimeout(loadPrevention, 1300);   // le responder applique les ordres en 1 s environ
+    return true;
+  } catch (e) {
+    showToast("Impossible de joindre le serveur", "error");
+    return false;
+  }
+}
+
+async function loadPrevention() {
+  if (prevBusy) return;
+  prevBusy = true;
+  try {
+    const res = await fetch("/api/prevention");
+    if (!res.ok) throw new Error(res.status);
+    prevData = await res.json();
+    prevSkew = prevData.now * 1000 - Date.now();
+    updatePrevBadge();
+    if (!document.getElementById("page-prevention").classList.contains("hidden")) renderPrevention();
+  } catch (e) {
+    if (!prevData) document.getElementById("prev-banner").innerHTML =
+      `<div class="alert alert-error text-sm"><span>Impossible de lire l'état de la prévention.</span></div>`;
+  } finally {
+    prevBusy = false;
+  }
+}
+
+function updatePrevBadge() {
+  const badge = document.getElementById("prev-badge");
+  const blocks = prevData ? prevData.blocks : [];
+  const real = blocks.filter(b => !b.dry_run).length;
+  badge.textContent = blocks.length;
+  badge.classList.toggle("hidden", blocks.length === 0);
+  badge.classList.toggle("badge-error", real > 0);
+  badge.classList.toggle("badge-warning", real === 0);
+}
+
+function renderPrevention() {
+  const d = prevData, r = d.responder;
+  const alerts = [];
+  if (!r.alive) {
+    alerts.push(`<div class="alert alert-warning text-sm"><span>Le service de prévention ne répond pas${r.age_s != null ? ` (dernier signe de vie il y a ${fmtDur(r.age_s)})` : ""}. Les ordres envoyés seront appliqués dès son retour.</span></div>`);
+  } else if (r.fw_ok === false) {
+    alerts.push(`<div class="alert alert-warning text-sm"><span>Pare-feu indisponible sur le serveur : la prévention fonctionne en simulation seulement.</span></div>`);
+  }
+  if (d.pending > 0) alerts.push(`<div class="alert alert-info text-sm"><span>${d.pending} ordre(s) en cours d'application…</span></div>`);
+  document.getElementById("prev-banner").innerHTML = alerts.join("");
+
+  // mode + profil
+  document.querySelectorAll("[data-mode]").forEach(b => {
+    const on = r.mode === b.dataset.mode;
+    b.classList.toggle("btn-primary", on);
+    b.classList.toggle("btn-outline", !on);
+  });
+  let modeHelp = (MODE_INFO[r.mode] || {}).help || "";
+  if (r.mode === "enforce" && r.fw_ok === false) modeHelp += " (pare-feu indisponible : simulation seulement)";
+  document.getElementById("prev-mode-help").textContent = modeHelp || "État inconnu.";
+
+  document.querySelectorAll("[data-profile]").forEach(b => {
+    const on = r.profile === b.dataset.profile;
+    b.classList.toggle("btn-primary", on);
+    b.classList.toggle("btn-outline", !on);
+  });
+  const rules = r.rules || {};
+  const ttl = f => rules[f] && rules[f].ttl_s != null ? fmtDur(rules[f].ttl_s) : "--";
+  const durations = `Durées actuelles : DDoS ${ttl("ddos")}, brute force ${ttl("brute_force")}${r.max_ttl_s ? `, plafond ${fmtDur(r.max_ttl_s)}` : ""}.`;
+  const pHelp = r.profile === "custom" ? "Durées personnalisées (modifiées en dehors du dashboard)." : (PROFILE_INFO[r.profile] || {}).help || "";
+  document.getElementById("prev-profile-help").textContent = `${pHelp} ${durations}`.trim();
+
+  // etat
+  const resp = document.getElementById("prev-kpi-resp");
+  resp.textContent = r.alive ? "Actif" : "Arrêté";
+  resp.className = `badge badge-sm ${r.alive ? "badge-success" : "badge-error"}`;
+  document.getElementById("prev-kpi-active").textContent = d.blocks.filter(b => !b.dry_run).length;
+  document.getElementById("prev-kpi-sim").textContent = d.blocks.filter(b => b.dry_run).length;
+
+  // IP bloquees
+  const tbody = document.getElementById("prev-blocks-body");
+  tbody.innerHTML = d.blocks.length ? d.blocks.map(b => `<tr>
+      <td class="font-mono text-xs">${escapeHtml(b.ip)}</td>
+      <td>${famBadge(b.family)}</td>
+      <td class="text-xs">${escapeHtml(b.fine || "--")}</td>
+      <td class="text-xs">${utcTime(b.since * 1000)}</td>
+      <td class="text-xs">${fmtDur(b.duration_s)}</td>
+      <td style="min-width:150px">
+        <div class="text-xs mb-1" data-remaining data-until="${b.until}">${fmtDur(b.remaining_s)}</div>
+        <progress class="progress ${b.dry_run ? "progress-warning" : "progress-error"} w-full" data-bar data-until="${b.until}" value="${b.remaining_s}" max="${b.duration_s}"></progress>
+      </td>
+      <td><span class="badge badge-sm ${b.dry_run ? "badge-warning" : "badge-error"}">${b.dry_run ? "SIMULÉ" : "ACTIF"}</span></td>
+      <td><button class="btn btn-xs btn-outline" data-unblock="${escapeHtml(b.ip)}">Débloquer</button></td>
+    </tr>`).join("")
+    : `<tr><td colspan="8" class="text-center text-base-content/50 py-8">Aucune IP bloquée actuellement.</td></tr>`;
+  document.getElementById("prev-unblock-all").disabled = d.blocks.length === 0;
+
+  // journal des decisions
+  const quiet = document.getElementById("prev-events-quiet").checked;
+  const evs = d.events.filter(e => quiet || !QUIET_EVENTS.includes(e.event)).slice(0, 60);
+  document.getElementById("prev-events-body").innerHTML = evs.length ? evs.map(e => {
+    const [label, cls] = EVENT_LABEL[e.event] || [e.event, "badge-ghost"];
+    const fam = e.family ? `${escapeHtml(e.family)}${e.fine ? " / " + escapeHtml(e.fine) : ""}` : "--";
+    const detail = [e.reason, e.ttl_s ? `durée ${fmtDur(e.ttl_s)}` : ""].filter(Boolean).map(escapeHtml).join(" · ");
+    return `<tr>
+      <td class="text-xs">${utcTime(e.ts)}</td>
+      <td><span class="badge badge-sm ${cls}">${escapeHtml(label)}</span></td>
+      <td class="font-mono text-xs">${escapeHtml(e.ip || "--")}</td>
+      <td class="text-xs">${fam}</td>
+      <td class="text-xs text-base-content/70">${detail || "--"}</td>
+    </tr>`;
+  }).join("") : `<tr><td colspan="5" class="text-center text-base-content/50 py-6">Aucune décision enregistrée pour le moment.</td></tr>`;
+
+  // regles + IP protegees
+  const protoTxt = p => (p && p.length ? (p.length === 1 && p[0] === 6 ? "TCP uniquement" : "protocoles " + p.join(", ")) : "tous protocoles");
+  document.getElementById("prev-rules-body").innerHTML = Object.entries(rules).map(([f, rule]) => `<tr>
+      <td>${famBadge(f)}</td>
+      <td class="text-xs">${rule.action === "alert_only"
+        ? "Alerte seulement : jamais bloqué (un scan peut être légitime)"
+        : `Blocage de ${fmtDur(rule.ttl_s)} après au moins ${rule.min_events} flux en ${rule.window_s} s, confiance ≥ ${Math.round(rule.min_confidence * 100)} %, ${protoTxt(rule.protocols)}`}</td>
+    </tr>`).join("") || `<tr><td colspan="2" class="text-base-content/50">Règles indisponibles.</td></tr>`;
+  document.getElementById("prev-allow").innerHTML = (r.allow || []).map(a => `<span class="badge badge-outline font-mono text-xs">${escapeHtml(a)}</span>`).join("")
+    || `<span class="text-xs text-base-content/50">Aucune information.</span>`;
+}
+
+function tickCountdown() {
+  if (!prevData) return;
+  const now = (Date.now() + prevSkew) / 1000;
+  document.querySelectorAll("[data-remaining]").forEach(el => {
+    const left = el.dataset.until - now;
+    el.textContent = left > 0 ? fmtDur(left) : "expiré";
+  });
+  document.querySelectorAll("[data-bar]").forEach(el => { el.value = Math.max(0, el.dataset.until - now); });
+}
+
+document.querySelectorAll("[data-mode]").forEach(btn => btn.addEventListener("click", () => {
+  const mode = btn.dataset.mode;
+  if (!prevData || prevData.responder.mode === mode) return;
+  const real = prevData.blocks.filter(b => !b.dry_run).length;
+  if (mode === "enforce" && !confirm("Passer en blocage actif ?\n\nLes IP détectées comme malveillantes seront réellement bloquées sur le serveur (temporairement).")) return;
+  if (prevData.responder.mode === "enforce" && real > 0 &&
+      !confirm(`Quitter le blocage actif ?\n\n${real} IP actuellement bloquée(s) seront débloquées.`)) return;
+  prevCommand({ cmd: "set_mode", value: mode }, `Mode « ${MODE_INFO[mode].label} » demandé`);
+}));
+document.querySelectorAll("[data-profile]").forEach(btn => btn.addEventListener("click", () => {
+  const profile = btn.dataset.profile;
+  if (!prevData || prevData.responder.profile === profile) return;
+  prevCommand({ cmd: "set_profile", value: profile }, `Profil « ${PROFILE_INFO[profile].label} » demandé`);
+}));
+document.getElementById("prev-blocks-body").addEventListener("click", e => {
+  const btn = e.target.closest("[data-unblock]");
+  if (!btn) return;
+  btn.disabled = true;
+  prevCommand({ cmd: "unblock", ip: btn.dataset.unblock }, `Déblocage de ${btn.dataset.unblock} demandé`).then(ok => { if (!ok) btn.disabled = false; });
+});
+document.getElementById("prev-unblock-all").addEventListener("click", () => {
+  if (!prevData || !prevData.blocks.length) return;
+  if (!confirm(`Débloquer les ${prevData.blocks.length} IP ?`)) return;
+  prevCommand({ cmd: "unblock_all" }, "Déblocage général demandé");
+});
+document.getElementById("prev-events-quiet").addEventListener("change", () => { if (prevData) renderPrevention(); });
+
+// Sondage : toutes les 2 s sur la page Prevention, toutes les 6 s ailleurs (pour le badge du menu).
+setInterval(() => {
+  prevTick++;
+  const visible = !document.getElementById("page-prevention").classList.contains("hidden");
+  if (visible || prevTick % 3 === 0) loadPrevention();
+}, 2000);
+setInterval(tickCountdown, 1000);
+
+// ============================================================
 // Init
 // ============================================================
 async function loadWhoami() {
@@ -519,4 +749,5 @@ initCharts();
 loadWhoami();
 pollSystem();
 setInterval(pollSystem, 5000);
+loadPrevention();
 loadInitial().then(connectStream);

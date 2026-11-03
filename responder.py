@@ -14,7 +14,8 @@ from datetime import datetime, timezone
 DATA = os.environ.get("NIDS_DATA", "/data")
 LOG_PATH = f"{DATA}/detections_v6.jsonl"
 POLICY_PATH = f"{DATA}/config/response_policy.json"
-UNBLOCK_PATH = f"{DATA}/config/unblock_requests.json"
+COMMANDS_DIR = f"{DATA}/config/commands"      # ordres deposes par le dashboard ou la CLI
+STATUS_PATH = f"{DATA}/responder_status.json"   # battement de coeur lu par le dashboard
 STATE_PATH = f"{DATA}/blocks.json"
 EVENTS_PATH = f"{DATA}/response_events.jsonl"
 
@@ -27,6 +28,8 @@ PROFILES = {
     "demo":   {"max_ttl_s": 60,    "ttl_s": {"ddos": 60,  "brute_force": 60}},
     "strict": {"max_ttl_s": 86400, "ttl_s": {"ddos": 600, "brute_force": 900}},
 }
+
+MODES = ("off", "dry-run", "enforce")
 
 DEFAULT_POLICY = {
     "mode": "dry-run",
@@ -107,6 +110,23 @@ def load_policy():
     return p
 
 
+def current_profile(pol):
+    """Nom du profil dont les durees correspondent a la politique, sinon 'custom'."""
+    for name, prof in PROFILES.items():
+        if pol.get("max_ttl_s") == prof["max_ttl_s"] and all(
+                pol.get("rules", {}).get(f, {}).get("ttl_s") == t for f, t in prof["ttl_s"].items()):
+            return name
+    return "custom"
+
+
+def with_profile(pol, name):
+    prof = PROFILES[name]
+    pol["max_ttl_s"] = prof["max_ttl_s"]
+    for fam, ttl in prof["ttl_s"].items():
+        pol.setdefault("rules", {}).setdefault(fam, copy.deepcopy(DEFAULT_POLICY["rules"][fam]))["ttl_s"] = ttl
+    return pol
+
+
 # ------------------------------------------------------------------ pare-feu
 class NullFirewall:
     def setup(self, active): return True
@@ -169,7 +189,14 @@ class Engine:
         self.allow = nets(policy["allowlist"]) | self.auto_protected
         if policy["mode"] == "enforce" and previous != "enforce":
             # les blocages "simules" ne deviennent pas reels a posteriori
-            self.blocked = {k: v for k, v in self.blocked.items() if not v["dry_run"]}
+            kept = {k: v for k, v in self.blocked.items() if not v["dry_run"]}
+            if len(kept) != len(self.blocked):
+                self.blocked = kept
+                self.save()     # le dashboard lit ce fichier : il ne doit plus afficher d'IP simulee
+        if previous == "enforce" and policy["mode"] != "enforce":
+            # on quitte le blocage reel : "simulation" et "desactive" ne doivent plus
+            # rien bloquer, donc on leve aussi les blocages deja en place
+            self.release_all(time.time(), f"mode {policy['mode']}")
 
     def is_protected(self, addr):
         return any(addr in n for n in self.allow)
@@ -261,6 +288,12 @@ class Engine:
         self.save()
         return True
 
+    def release_all(self, now, reason="manuel"):
+        n = 0
+        for ip in list(self.blocked):
+            n += bool(self.unblock(ip, now, reason))
+        return n
+
     def expire(self, now):
         for ip, b in list(self.blocked.items()):
             if b["until"] <= now:
@@ -309,8 +342,66 @@ def tail(path):
             time.sleep(1)
 
 
+def send_command(cmd, **kw):
+    """Depose un ordre pour le demon (utilise par la CLI ; le dashboard fait pareil).
+    Un fichier par ordre, ecrit de facon atomique : jamais d'ordre perdu ni lu a moitie."""
+    os.makedirs(COMMANDS_DIR, exist_ok=True)
+    name = f"{time.time_ns()}-{os.getpid()}.json"
+    write_json(os.path.join(COMMANDS_DIR, name), {"cmd": cmd, **kw})
+
+
+def process_commands(eng, now):
+    """Execute les ordres en attente. Renvoie True si la politique a change."""
+    try:
+        names = sorted(n for n in os.listdir(COMMANDS_DIR) if n.endswith(".json"))
+    except FileNotFoundError:
+        return False
+    changed = False
+    for name in names:
+        path = os.path.join(COMMANDS_DIR, name)
+        cmd = read_json(path, None)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        if not isinstance(cmd, dict):
+            continue
+        kind, src = cmd.get("cmd"), str(cmd.get("source", "inconnu"))
+        value = cmd.get("value")
+        if kind == "unblock":
+            eng.unblock(str(cmd.get("ip", "")), now, f"manuel ({src})")
+        elif kind == "unblock_all":
+            n = eng.release_all(now, f"manuel ({src})")
+            eng.event(now, "config", "", reason=f"deblocage general : {n} IP ({src})")
+        elif kind == "set_mode" and value in MODES:
+            pol = read_json(POLICY_PATH, copy.deepcopy(DEFAULT_POLICY))
+            pol["mode"] = value
+            write_json(POLICY_PATH, pol)
+            eng.event(now, "config", "", reason=f"mode -> {value} ({src})")
+            changed = True
+        elif kind == "set_profile" and value in PROFILES:
+            pol = with_profile(read_json(POLICY_PATH, copy.deepcopy(DEFAULT_POLICY)), value)
+            write_json(POLICY_PATH, pol)
+            eng.event(now, "config", "", reason=f"profil -> {value} ({src})")
+            changed = True
+    return changed
+
+
+def write_status(eng, now):
+    """Battement de coeur lu par le dashboard : etat reel du responder."""
+    pol = eng.policy
+    write_json(STATUS_PATH, {
+        "ts": now, "pid": os.getpid(), "mode": pol["mode"], "profile": current_profile(pol),
+        "fw_ok": eng.fw_ok, "enforcing": pol["mode"] == "enforce" and eng.fw_ok,
+        "max_ttl_s": pol["max_ttl_s"], "max_active_blocks": pol["max_active_blocks"],
+        "active_blocks": len(eng.blocked), "allow": sorted(str(n) for n in eng.allow),
+        "rules": pol["rules"],
+    })
+
+
 def run_daemon():
     os.makedirs(f"{DATA}/config", exist_ok=True)
+    os.makedirs(COMMANDS_DIR, exist_ok=True)
     if not os.path.exists(POLICY_PATH):
         write_json(POLICY_PATH, DEFAULT_POLICY)
     policy = load_policy()
@@ -318,9 +409,12 @@ def run_daemon():
     eng = Engine(policy, fw, auto_protected())
     fw_ok = fw.setup(eng.restore())
     eng.fw_ok = fw_ok
+    eng.save()      # purge du fichier d'etat (entrees simulees ou expirees d'une execution precedente)
     if not fw_ok:
         print("[responder] pare-feu indisponible : fonctionnement force en dry-run", flush=True)
-    print(f"[responder] mode={policy['mode']}  proteges={sorted(map(str, eng.allow))}", flush=True)
+    print(f"[responder] mode={policy['mode']}  profil={current_profile(policy)}  "
+          f"proteges={sorted(map(str, eng.allow))}", flush=True)
+    write_status(eng, time.time())
 
     mtime, last = os.path.getmtime(POLICY_PATH), 0
     for line in tail(LOG_PATH):
@@ -330,18 +424,16 @@ def run_daemon():
                 eng.handle(json.loads(line), now)
             except (json.JSONDecodeError, TypeError):
                 pass
-        if now - last >= 2:
+        if now - last >= 1:
             last = now
+            process_commands(eng, now)
             if os.path.getmtime(POLICY_PATH) != mtime:
                 mtime = os.path.getmtime(POLICY_PATH)
                 eng.set_policy(load_policy())
-                print(f"[responder] politique rechargee, mode={eng.policy['mode']}", flush=True)
-            reqs = read_json(UNBLOCK_PATH, [])
-            if reqs:
-                for ip in reqs:
-                    eng.unblock(str(ip), now)
-                write_json(UNBLOCK_PATH, [])
+                print(f"[responder] politique rechargee, mode={eng.policy['mode']}, "
+                      f"profil={current_profile(eng.policy)}", flush=True)
             eng.expire(now)
+            write_status(eng, now)
 
 
 # ------------------------------------------------------------------ replay (reglage des seuils)
@@ -385,6 +477,7 @@ def main():
     ap.add_argument("--set-profile", choices=sorted(PROFILES),
                     help="duree des blocages : demo (60 s, sans escalade) ou strict (10-15 min, escalade jusqu'a 24 h)")
     ap.add_argument("--unblock", metavar="IP")
+    ap.add_argument("--unblock-all", action="store_true", help="leve tous les blocages")
     ap.add_argument("--replay", metavar="FICHIER.jsonl",
                     help="rejoue un journal en dry-run pour regler les seuils")
     a = ap.parse_args()
@@ -396,20 +489,18 @@ def main():
         write_json(POLICY_PATH, p)
         return print(f"mode -> {a.set_mode} (pris en compte sous ~2 s)")
     if a.set_profile:
-        prof = PROFILES[a.set_profile]
-        p = read_json(POLICY_PATH, copy.deepcopy(DEFAULT_POLICY))
-        p["max_ttl_s"] = prof["max_ttl_s"]
-        for fam, ttl in prof["ttl_s"].items():
-            p.setdefault("rules", {}).setdefault(fam, copy.deepcopy(DEFAULT_POLICY["rules"][fam]))["ttl_s"] = ttl
+        p = with_profile(read_json(POLICY_PATH, copy.deepcopy(DEFAULT_POLICY)), a.set_profile)
         write_json(POLICY_PATH, p)
         return print(f"profil -> {a.set_profile} : {describe_ttl(p)} (pris en compte sous ~2 s)")
     if a.unblock:
-        reqs = read_json(UNBLOCK_PATH, [])
-        write_json(UNBLOCK_PATH, reqs + [a.unblock])
+        send_command("unblock", ip=a.unblock, source="console")
         return print(f"demande de deblocage envoyee pour {a.unblock}")
+    if a.unblock_all:
+        send_command("unblock_all", source="console")
+        return print("demande de deblocage general envoyee")
     if a.status:
         pol = load_policy()
-        print("mode :", pol["mode"])
+        print("mode :", pol["mode"], "| profil :", current_profile(pol))
         print("durees :", describe_ttl(pol))
         blocks = read_json(STATE_PATH, {}).get("blocks", {})
         if not blocks:
