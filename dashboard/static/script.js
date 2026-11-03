@@ -2,12 +2,12 @@
 // flux SSE en direct, et chargement a la demande pour Performance/Parametres.
 
 const TIMELINE_MINUTES = 30;
-<<<<<<< HEAD
+
 const GROUP_WINDOW_MS = 3000;
 const PAGE_TITLES = { dashboard: "Tableau de bord", alerts: "Alertes", performance: "Performance du modèle", prevention: "Prévention", settings: "Paramètres" };
-=======
+
 const PAGE_TITLES = { dashboard: "Tableau de bord", alerts: "Alertes", performance: "Performance du modèle", settings: "Paramètres" };
->>>>>>> d7a75a312beb9b3f76bcc4776b690a2dd993b3c0
+
 const FAMILY_COLOR = { benign: "#16a34a", scan: "#f59e0b", ddos: "#ef4444", brute_force: "#a855f7" };
 
 // ============================================================
