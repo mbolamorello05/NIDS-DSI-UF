@@ -7,7 +7,7 @@ propre conteneur (network_mode: host + NET_ADMIN) : le detecteur reste passif.
 
 Modes : off | dry-run (defaut : journalise "bloquerait", ne touche a rien) | enforce
 """
-import argparse, copy, ipaddress, json, os, socket, struct, subprocess, sys, time
+import argparse, copy, ipaddress, json, os, signal, socket, struct, subprocess, sys, time
 from collections import Counter, defaultdict, deque
 from datetime import datetime, timezone
 
@@ -36,6 +36,7 @@ DEFAULT_POLICY = {
     "allowlist": [],              # IP/CIDR jamais bloquees (scanners du SOC, poste admin...)
     "max_active_blocks": 50,      # disjoncteur : au-dela, plus aucun blocage automatique
     "max_ttl_s": PROFILES["demo"]["max_ttl_s"],   # plafond de la duree (escalade comprise)
+    "history_reset_s": 86400,     # sans nouveau blocage pendant 24 h, l'escalade repart de zero
     "rules": {
         # Un scan peut etre legitime (SOC, audit) : on alerte, on ne bloque pas.
         "scan": {"action": "alert_only"},
@@ -101,13 +102,110 @@ def auto_protected():
         pass
     return nets(found)
 
-def load_policy():
-    user = read_json(POLICY_PATH, {})
+_warned = set()
+
+
+def _warn(msg):
+    if msg not in _warned:                 # un avertissement n'est affiche qu'une fois
+        _warned.add(msg)
+        print(f"[responder] politique : {msg}", flush=True)
+
+
+def _num(v, lo, hi, default, name, integer=False):
+    """Nombre dans [lo, hi], sinon valeur par defaut (et avertissement)."""
+    try:
+        if isinstance(v, bool):
+            raise ValueError
+        x = float(v)
+        if not (lo <= x <= hi):            # refuse aussi NaN et l'infini
+            raise ValueError
+        return int(x) if integer or x == int(x) else x
+    except (TypeError, ValueError, OverflowError):
+        _warn(f"{name} invalide ({v!r}), valeur par defaut {default}")
+        return default
+
+
+BLOCK_DEFAULTS = {"min_confidence": 0.95, "min_proba": 0.9, "min_events": 20, "window_s": 30, "ttl_s": 60}
+
+
+def _sanitize_rule(fam, r):
+    if not isinstance(r, dict):
+        _warn(f"regle {fam!r} ignoree (objet attendu)")
+        return None
+    action = r.get("action")
+    if action not in ("alert_only", "block"):
+        _warn(f"regle {fam!r} : action {action!r} inconnue, 'alert_only' retenue")
+        action = "alert_only"
+    out = {"action": action}
+    if action == "block":
+        base = {**BLOCK_DEFAULTS, **{k: v for k, v in DEFAULT_POLICY["rules"].get(fam, {}).items() if k in BLOCK_DEFAULTS}}
+        out["min_confidence"] = _num(r.get("min_confidence", base["min_confidence"]), 0, 1, base["min_confidence"], f"{fam}.min_confidence")
+        out["min_proba"] = _num(r.get("min_proba", base["min_proba"]), 0, 1, base["min_proba"], f"{fam}.min_proba")
+        out["min_events"] = _num(r.get("min_events", base["min_events"]), 1, 100000, base["min_events"], f"{fam}.min_events", True)
+        out["window_s"] = _num(r.get("window_s", base["window_s"]), 1, 86400, base["window_s"], f"{fam}.window_s")
+        out["ttl_s"] = _num(r.get("ttl_s", base["ttl_s"]), 1, 31536000, base["ttl_s"], f"{fam}.ttl_s")
+        if "protocols" in r:
+            p = r["protocols"]
+            if isinstance(p, list) and all(isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= 255 for x in p):
+                out["protocols"] = p
+            else:
+                _warn(f"{fam}.protocols invalide ({p!r}), TCP seulement")
+                out["protocols"] = [6]
+    return out
+
+
+def sanitize_policy(user):
+    """Une politique mal ecrite (a la main, ou par une ancienne version) ne doit
+    jamais faire tomber le responder : chaque valeur invalide est remplacee par
+    sa valeur par defaut, avec un avertissement dans les logs."""
     p = copy.deepcopy(DEFAULT_POLICY)
-    p.update(user)
-    if p["mode"] not in ("off", "dry-run", "enforce"):
-        p["mode"] = "dry-run"
+    if not isinstance(user, dict):
+        _warn("fichier de politique illisible, valeurs par defaut")
+        return p
+    mode = user.get("mode", p["mode"])
+    if mode in MODES:
+        p["mode"] = mode
+    else:
+        _warn(f"mode {mode!r} inconnu, 'dry-run' retenu")
+    allow = user.get("allowlist", [])
+    if isinstance(allow, list):
+        p["allowlist"] = [str(x) for x in allow]
+    else:
+        _warn("allowlist invalide (liste attendue), ignoree")
+    p["max_active_blocks"] = _num(user.get("max_active_blocks", p["max_active_blocks"]), 1, 100000, p["max_active_blocks"], "max_active_blocks", True)
+    p["max_ttl_s"] = _num(user.get("max_ttl_s", p["max_ttl_s"]), 1, 31536000, p["max_ttl_s"], "max_ttl_s")
+    p["history_reset_s"] = _num(user.get("history_reset_s", p["history_reset_s"]), 60, 31536000, p["history_reset_s"], "history_reset_s")
+    rules = user.get("rules")
+    if isinstance(rules, dict):
+        p["rules"] = {f: r for f, r in ((f, _sanitize_rule(f, r)) for f, r in rules.items()) if r is not None}
+    elif rules is not None:
+        _warn("rules invalide (objet attendu), regles par defaut")
     return p
+
+
+def load_policy():
+    return sanitize_policy(read_json(POLICY_PATH, {}))
+
+
+def trim_log(path, max_bytes=5 * 1024 * 1024, keep=20000):
+    """Borne un journal : au-dela de max_bytes, ne garde que les `keep` dernieres lignes."""
+    try:
+        size = os.path.getsize(path)
+        if size <= max_bytes:
+            return False
+        start = max(0, size - 8 * 1024 * 1024)
+        with open(path, "rb") as f:
+            f.seek(start)
+            lines = f.read().splitlines()
+        if start:
+            lines = lines[1:]                  # la premiere ligne de la fenetre est coupee
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(b"\n".join(lines[-keep:]) + b"\n")
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
 
 
 def current_profile(pol):
@@ -130,6 +228,7 @@ def with_profile(pol, name):
 # ------------------------------------------------------------------ pare-feu
 class NullFirewall:
     def setup(self, active): return True
+    def teardown(self): return True
     def block(self, ip, ttl): return True
     def unblock(self, ip): return True
 
@@ -164,6 +263,15 @@ table inet nids {
                 self.block(ip, ttl)
         return ok
 
+    def teardown(self):
+        """A l'arret du responder : on retire nos regles (jamais de blocage invisible
+        que l'administrateur ne pourrait plus lever). L'etat reste dans blocks.json
+        et les blocages non expires sont remis en place au prochain demarrage."""
+        try:
+            return subprocess.run(["nft", "delete", "table", "inet", "nids"], capture_output=True).returncode == 0
+        except FileNotFoundError:
+            return False
+
     def block(self, ip, ttl):
         return self._nft(f"add element inet nids blocked {{ {ip} timeout {int(ttl)}s }}")
 
@@ -177,6 +285,8 @@ class Engine:
         self.fw, self.auto_protected, self.persist, self.fw_ok = fw, protected, persist, fw_ok
         self.blocked = {}                 # ip -> infos du blocage en cours
         self.history = Counter()          # ip -> nb de blocages passes (escalade)
+        self.last_end = {}                # ip -> fin de son dernier blocage (oubli de l'escalade)
+        self._pruned = 0.0
         self.windows = defaultdict(deque)
         self.throttle = {}
         self.stats = Counter()
@@ -265,12 +375,15 @@ class Engine:
                 self.event(now, "circuit_breaker", ip, family=fam,
                            reason="trop de blocages actifs : blocage automatique suspendu")
             return
-        ttl = min(rule["ttl_s"] * 2 ** self.history[ip], self.policy["max_ttl_s"])
+        if self.history[ip] and now - self.last_end.get(ip, 0) > self.policy["history_reset_s"]:
+            self.history[ip] = 0       # longtemps tranquille : on repart de la duree de base
+        ttl = min(rule["ttl_s"] * 2 ** min(self.history[ip], 20), self.policy["max_ttl_s"])
         dry = self.policy["mode"] != "enforce" or not self.fw_ok
         if not dry and not self.fw.block(ip, ttl):
             self.event(now, "error", ip, family=fam, reason="echec du blocage nftables")
             return
         self.history[ip] += 1
+        self.last_end[ip] = now + ttl
         self.blocked[ip] = {"since": now, "until": now + ttl, "family": fam,
                             "fine": fine, "dry_run": dry}
         self.windows.pop((ip, fam), None)
@@ -300,15 +413,23 @@ class Engine:
                 del self.blocked[ip]       # nftables retire deja l'IP (timeout)
                 self.event(now, "expired", ip, family=b["family"])
                 self.save()
+        if now - self._pruned >= 3600:     # memoire bornee : on oublie les IP calmes depuis longtemps
+            self._pruned = now
+            reset = self.policy["history_reset_s"]
+            for ip in [i for i in set(self.history) | set(self.last_end)
+                       if i not in self.blocked and now - self.last_end.get(i, 0) > reset]:
+                self.history.pop(ip, None)
+                self.last_end.pop(ip, None)
 
     def save(self):
         if self.persist:
-            write_json(STATE_PATH, {"blocks": self.blocked, "history": dict(self.history)})
+            write_json(STATE_PATH, {"blocks": self.blocked, "history": dict(self.history), "last_end": self.last_end})
 
     def restore(self):
         """Recharge les blocages reels non expires ; retourne {ip: ttl_restant}."""
         st, now = read_json(STATE_PATH, {}), time.time()
         self.history.update(st.get("history", {}))
+        self.last_end.update(st.get("last_end", {}))
         for ip, b in st.get("blocks", {}).items():
             if b["until"] > now and not b["dry_run"]:
                 self.blocked[ip] = b
@@ -387,7 +508,7 @@ def process_commands(eng, now):
     return changed
 
 
-def write_status(eng, now):
+def write_status(eng, now, started=None, stopped=False):
     """Battement de coeur lu par le dashboard : etat reel du responder."""
     pol = eng.policy
     write_json(STATUS_PATH, {
@@ -395,11 +516,27 @@ def write_status(eng, now):
         "fw_ok": eng.fw_ok, "enforcing": pol["mode"] == "enforce" and eng.fw_ok,
         "max_ttl_s": pol["max_ttl_s"], "max_active_blocks": pol["max_active_blocks"],
         "active_blocks": len(eng.blocked), "allow": sorted(str(n) for n in eng.allow),
-        "rules": pol["rules"],
+        "rules": pol["rules"], "stats": dict(eng.stats),
+        "started_at": started or now, "stopped": stopped,
     })
 
 
+STOP = False
+
+
+def _request_stop(signum, frame):
+    global STOP
+    STOP = True
+
+
 def run_daemon():
+    global STOP
+    STOP = False
+    # PID 1 d'un conteneur ignore SIGTERM par defaut : sans ce gestionnaire, "docker stop"
+    # attendait 10 s puis tuait le processus sans retirer les regles du pare-feu.
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
+
     os.makedirs(f"{DATA}/config", exist_ok=True)
     os.makedirs(COMMANDS_DIR, exist_ok=True)
     if not os.path.exists(POLICY_PATH):
@@ -410,30 +547,55 @@ def run_daemon():
     fw_ok = fw.setup(eng.restore())
     eng.fw_ok = fw_ok
     eng.save()      # purge du fichier d'etat (entrees simulees ou expirees d'une execution precedente)
+    trim_log(EVENTS_PATH)
     if not fw_ok:
         print("[responder] pare-feu indisponible : fonctionnement force en dry-run", flush=True)
     print(f"[responder] mode={policy['mode']}  profil={current_profile(policy)}  "
           f"proteges={sorted(map(str, eng.allow))}", flush=True)
-    write_status(eng, time.time())
+    started = time.time()
+    write_status(eng, started, started)
 
-    mtime, last = os.path.getmtime(POLICY_PATH), 0
+    mtime, last, last_trim = os.path.getmtime(POLICY_PATH), 0, started
     for line in tail(LOG_PATH):
+        if STOP:
+            break
         now = time.time()
         if line:
             try:
                 eng.handle(json.loads(line), now)
-            except (json.JSONDecodeError, TypeError):
+            except json.JSONDecodeError:
                 pass
+            except Exception as exc:       # une ligne etrange ne doit JAMAIS arreter la protection
+                eng.stats["erreurs"] += 1
+                if eng.once(("erreur", type(exc).__name__), now, 60):
+                    print(f"[responder] ligne ignoree ({type(exc).__name__}: {exc})", flush=True)
         if now - last >= 1:
             last = now
-            process_commands(eng, now)
-            if os.path.getmtime(POLICY_PATH) != mtime:
-                mtime = os.path.getmtime(POLICY_PATH)
-                eng.set_policy(load_policy())
-                print(f"[responder] politique rechargee, mode={eng.policy['mode']}, "
-                      f"profil={current_profile(eng.policy)}", flush=True)
-            eng.expire(now)
-            write_status(eng, now)
+            try:
+                process_commands(eng, now)
+                if os.path.getmtime(POLICY_PATH) != mtime:
+                    mtime = os.path.getmtime(POLICY_PATH)
+                    eng.set_policy(load_policy())
+                    print(f"[responder] politique rechargee, mode={eng.policy['mode']}, "
+                          f"profil={current_profile(eng.policy)}", flush=True)
+                eng.expire(now)
+                if now - last_trim >= 600:
+                    last_trim = now
+                    trim_log(EVENTS_PATH)
+                write_status(eng, now, started)
+            except Exception as exc:       # idem pour l'entretien (ordres, politique, statut)
+                eng.stats["erreurs"] += 1
+                if eng.once(("entretien", type(exc).__name__), now, 60):
+                    print(f"[responder] erreur d'entretien ({type(exc).__name__}: {exc})", flush=True)
+
+    print("[responder] arret demande : retrait des regles de pare-feu", flush=True)
+    try:
+        eng.save()
+        if fw_ok:
+            fw.teardown()
+        write_status(eng, time.time(), started, stopped=True)
+    except Exception as exc:
+        print(f"[responder] erreur a l'arret : {exc!r}", flush=True)
 
 
 # ------------------------------------------------------------------ replay (reglage des seuils)
